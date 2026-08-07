@@ -1,0 +1,10 @@
+{
+  "id": "meeting-recorder",
+  "name": { "zh": "会议记录员", "en": "Meeting Recorder" },
+  "icon": "message-circle",
+  "version": "1.0.0",
+  "layout": {
+    "main": [{ "type": "plugin:meeting-recorder:recorder" }]
+  },
+  "requires": { "views": ["plugin:meeting-recorder:recorder"] }
+}
