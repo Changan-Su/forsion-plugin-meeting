@@ -12,6 +12,12 @@
  * 录音结束 idle 不被传送进 done 页)/ 轮转 stop 与手动结束撞车不丢末段(FakeMediaRecorder onstop 异步派发 +
  * inactive 再 stop 抛错,同真机契约)/ 同文重复行动项行按行号定位 / MediaRecorder 构造失败报 ok:false 且状态栏
  * 不冻死 / 首装 ensureWorkFolder × upsertIndex 竞态不抹首条会议(索引写串行闸)。
+ * 双语轮加钉:MSG 两侧键集合相等(+ 占位符同名同数、英文侧零残留中文)/ mock ctx 的 getLocale 返回 'en'
+ * 且宿主广播语言变化时,**同一个已挂载视图不重挂**也必须重渲成英文,disposer 退订 subscribeLocale。
+ * 第三修复轮加钉:重渲是整树 innerHTML 重建 —— 未提交的输入(idle 标题/与会人、rec 要点草稿)与滚动位
+ * 必须快照回填,且回填的同时 placeholder 已换语言(否则「干脆不重渲」也能骗过前一条)/ 录音页与纪要页的
+ * 英文(纪要页喂一份内容全英文的会议:节名被 parseMeeting 剥掉,页面再出现中文即判 render 硬编码)/
+ * fmtDate 跟 zh-CN·en-US 走 / 列表分隔符按语言取,英文侧禁中文标点与 (s) 括号复数。
  * blobToWav16kBase64 在此 stub(node 给不起 AudioContext)——真实音频管线为真机验收项。
  * 跑法:node check.mjs
  */
@@ -175,16 +181,18 @@ globalThis.window = {
 
 // ── 求值 main.js(宿主同款) ──
 globalThis.__MEETING_TEST__ = {}
-const reg = { views: [], commands: [], settings: [], status: [] }
+const reg = { views: [], commands: [], settings: [], status: [], listSources: [] }
 const V = new Map()
 const writes = []
 const notes = []
+const navOpened = []; const navLoaded = [] // ctx.app.openFile / loadPage 的调用账本
 const sbUpdates = [] // 状态栏 update 轨迹(钉「构造失败不许冻死 ● 录音中」)
 const ctx = {
   registerView: (v) => reg.views.push(v),
   registerCommand: (c) => reg.commands.push(c),
   registerSetting: (s) => reg.settings.push(s),
   registerStatusItem: (s) => { reg.status.push(s); return { update: (u) => sbUpdates.push(u), dispose() {} } },
+  registerListSource: (x) => reg.listSources.push(x), // 统一左栏数据源(宿主 2026-08-25+)
   notify: (m, o) => notes.push({ m, o }),
   activity: { log() {} },
   openView() {},
@@ -192,7 +200,8 @@ const ctx = {
     notify: (m) => notes.push({ m }),
     readFile: async (p) => (V.has(p) ? V.get(p) : null),
     writeFile: async (p, t) => { V.set(p, t); writes.push(p) },
-    openFile() {},
+    openFile: (p) => navOpened.push(p),
+    loadPage: (p) => navLoaded.push(p), // 裸 .md 的正确开法(readflow 1.1.2 的生态级 P0-A)
     workFolder: () => '会议记录员',
   },
 }
@@ -649,7 +658,173 @@ A.ok(String(V.get(idxKey)).includes('first.md'), 'P2 钉:首条会议不被 ensu
 ctx.app.readFile = rfReal2
 V.set(idxKey, idxSaved)
 
-// ── 旧宿主(07-18 后 API 全删)setup 不抛 + 缺 transcribeAudio 横幅降级 ──
+// ── ⑦ 双语词表:zh/en 两侧键集合必须完全相等(漏翻一条就红),英文侧不许有残留中文 ──
+const zhKeys = Object.keys(T.MSG.zh).sort()
+const enKeys = Object.keys(T.MSG.en).sort()
+A.deepEqual(enKeys, zhKeys, '双语词表 MSG.zh / MSG.en 键集合必须完全相等')
+A.ok(zhKeys.length >= 60, `词表条目太少(${zhKeys.length}),UI 文案八成还有硬编码没进词表`)
+const CJK_RE = /[一-鿿]/
+for (const k of zhKeys) {
+  A.ok(String(T.MSG.zh[k]).trim(), `MSG.zh.${k} 不能是空串`)
+  A.ok(String(T.MSG.en[k]).trim(), `MSG.en.${k} 不能是空串`)
+  A.ok(!CJK_RE.test(String(T.MSG.en[k])), `MSG.en.${k} 里有残留中文:${T.MSG.en[k]}`)
+  // 占位符两侧必须同名同数(英文语序不同,只能靠 {name} 而不是拼接)
+  const vz = (String(T.MSG.zh[k]).match(/\{\w+\}/g) || []).sort().join(',')
+  const ve = (String(T.MSG.en[k]).match(/\{\w+\}/g) || []).sort().join(',')
+  A.equal(ve, vz, `MSG.${k} 两侧占位符不一致(zh=${vz} en=${ve})`)
+}
+A.equal(T.tl('en', 'segHint', { n: 5 }), 'Transcribed every 5 min (adjustable in plugin settings)', '占位符替换按 {name} 走')
+A.equal(T.tl('en', '__nope__'), '__nope__', '未知 key 回吐 key 本身,不抛')
+
+// ── ⑧ mock ctx 的 getLocale 返回 'en':视图**不重挂**也必须变英文(subscribeLocale 原地重渲) ──
+globalThis.__MEETING_TEST__ = {}
+let mockLocale = 'zh'
+const localeSubs = new Set()
+const reg3 = { views: [] }
+const V3 = new Map()
+const enCtx = {
+  registerView: (v) => reg3.views.push(v),
+  registerCommand: () => {},
+  registerSetting: () => {},
+  registerStatusItem: () => ({ update() {}, dispose() {} }),
+  notify: () => {},
+  activity: { log() {} },
+  openView() {},
+  getLocale: () => mockLocale,
+  subscribeLocale: (cb) => { localeSubs.add(cb); return () => localeSubs.delete(cb) },
+  app: {
+    notify: () => {},
+    readFile: async (p) => (V3.has(p) ? V3.get(p) : null),
+    writeFile: async (p, txt) => { V3.set(p, txt) },
+    openFile() {},
+    workFolder: () => '会议记录员',
+  },
+}
+const enDispose = new Function('ctx', src)(enCtx)
+const T3 = globalThis.__MEETING_TEST__
+A.equal(T3.L(), 'zh', 'getLocale 返回 zh 时词表走中文')
+let mount3Calls = 0
+const el3 = mkEl('host')
+const un3 = ((v) => { mount3Calls++; return v.mount(el3) })(reg3.views[0])
+await settle()
+const zhView = el3.textContent
+A.ok(zhView.includes('开始录音') && zhView.includes('行动项总览'), '中文态视图是中文文案')
+mockLocale = 'en'
+A.equal(T3.L(), 'en', "getLocale 返回 'en' 时词表切英文")
+A.ok(localeSubs.size >= 1, '插件必须订阅 ctx.subscribeLocale(否则切语言不跟)')
+for (const cb of localeSubs) cb('en')  // 宿主广播语言变化(**不重挂视图**)
+await settle()
+const enView = el3.textContent
+A.equal(mount3Calls, 1, '语言切换靠原地重渲,不许重挂视图(会打断录音/已开视图)')
+A.notEqual(enView, zhView, '切英文后界面文案必须真的变了')
+A.ok(enView.includes('Start recording'), `英文态应出现英文串,实得:${enView.replace(/\s+/g, ' ').slice(0, 120)}`)
+A.ok(enView.includes('All action items') && enView.includes('Meeting Recorder'), '英文态标题/标签页都翻了')
+A.ok(!enView.includes('开始录音') && !enView.includes('行动项总览'), '英文态不许残留中文按钮/标签')
+const cjkLeft = (enView.match(/[一-鿿]/g) || []).length
+A.ok(cjkLeft / Math.max(1, enView.length) < 0.05, `英文界面残留中文过多:${cjkLeft}/${enView.length}`)
+A.equal(T3.tl('en', 'sbIdle'), '🎙 Meeting', '状态栏英文文案')
+
+// ── ⑨ 重渲是整树 innerHTML 重建:未提交的 DOM 输入 / 滚动位必须自己快照回填 ──
+//    (录音、转写、生成在模块级本来就不受影响;被吞的是**没进模块级的**那半句草稿。
+//     README/CHANGELOG 写了「重渲不打断」,下面 idle / rec 两组断言就是那句话的证据。)
+mockLocale = 'zh'
+for (const cb of localeSubs) cb('zh')
+await settle()
+const in1 = findFirstSel(el3, '[data-title]')
+const in2 = findFirstSel(el3, '[data-attendees]')
+A.ok(in1 && in2, 'idle 页应有标题/与会人输入框')
+in1.value = '季度复盘会'
+in2.value = '张三, 李四'
+mockLocale = 'en'
+for (const cb of localeSubs) cb('en')
+await settle()
+const in1b = findFirstSel(el3, '[data-title]')
+A.notEqual(in1b, in1, '重渲确实重建了 DOM(否则下面两条断言什么也没测)')
+A.equal(in1b.value, '季度复盘会', '切语言不许吞掉 idle 表单里未提交的标题')
+A.equal(findFirstSel(el3, '[data-attendees]').value, '张三, 李四', '切语言不许吞掉未提交的与会人')
+A.equal(in1b.getAttribute('placeholder'), T3.tl('en', 'phTitle'), '值保住的同时 placeholder 必须已切英文(不是靠「干脆不重渲」蒙混)')
+
+// rec 页是最疼的一条:会中正打了一半的要点草稿 + 翻上去在读的转写滚动位
+T3.bus.emit({ type: 'rec-start' })
+await settle()
+const bin1 = findFirstSel(el3, '[data-bin]')
+const live1 = findFirstSel(el3, '[data-live]')
+A.ok(bin1 && live1, "'rec-start' 后应在录音页(要点输入框 + 实时转写栏都在)")
+// 录音页的英文:⑧ 只验到 idle,rec 页以前完全靠 MSG parity 兜底(D1 那条草稿丢失正是因此没被门禁抓到)
+const recEn = el3.textContent
+A.ok(recEn.includes('Stop recording') && recEn.includes('Live notes'), `录音页英文态应是英文,实得:${recEn.replace(/\s+/g, ' ').slice(0, 120)}`)
+A.ok(!recEn.includes('结束录音') && !recEn.includes('要点速记'), '录音页英文态不许残留中文按钮/标签')
+A.equal(bin1.getAttribute('placeholder'), T3.tl('en', 'phBullet'), '录音页 placeholder 也跟着切英文')
+bin1.value = '预算这块还没记完'
+live1.scrollTop = 137
+mockLocale = 'zh'
+for (const cb of localeSubs) cb('zh')
+await settle()
+const bin2 = findFirstSel(el3, '[data-bin]')
+A.notEqual(bin2, bin1, 'rec 页重渲确实重建了 DOM')
+A.equal(bin2.value, '预算这块还没记完', '会中切语言不许吞掉正在打的要点草稿(它不在模块级,rerender 必须自己接住)')
+A.equal(findFirstSel(el3, '[data-live]').scrollTop, 137, '切语言不许把实时转写的滚动位拽走')
+A.equal(bin2.getAttribute('placeholder'), T3.tl('zh', 'phBullet'), 'rec 页 placeholder 已切回中文')
+A.equal(mount3Calls, 1, '连切三次后视图仍只挂载过一次')
+
+// ── ⑩ 纪要页(done)的英文:门禁以前停在 idle(done 页要先有会议文件才进得去)。
+//    这里喂一份**内容全英文**的会议 —— 四个节名是数据契约(恒中文),但 parseMeeting 会把它们剥掉,
+//    渲染的只是节内容。所以页面上再冒出中文,就只可能是 renderDone 自己硬编码没进词表。
+mockLocale = 'en'
+for (const cb of localeSubs) cb('en')
+await settle()
+const donePath3 = '会议记录员/2026-08-14-quarterly-review.md' // 工作文件夹/文件名是数据契约,不随语言变
+V3.set(donePath3, [
+  '---', 'mt_title: Quarterly review', 'mt_date: 2026-08-14T07:30:00.000Z', 'mt_status: transcribed', 'mt_attendees: Alice, Bob', '---',
+  '', '## 要点速记', '- 10:03 budget cut by 20%',
+  '', '## 转写', '[00:10:03] We need to cut the budget by twenty percent.',
+  '', '## 纪要', '', '## 行动项', '',
+].join('\n'))
+T3.bus.emit({ type: 'rec-done', path: donePath3 })
+await settle()
+const doneEn = el3.textContent
+A.ok(doneEn.includes('Quarterly review'), `'rec-done' 应把录音页送进纪要页,实得:${doneEn.replace(/\s+/g, ' ').slice(0, 120)}`)
+// 'Minutes' 大写只可能来自 tab(labMinutes 是 'Meeting minutes',小写 m),所以三个 tab 各自都钉到了
+A.ok(doneEn.includes('Generate minutes') && doneEn.includes('Minutes') && doneEn.includes('Transcript') && doneEn.includes('Action items'), '纪要页英文态:生成按钮与三个 tab 都翻了')
+A.ok(doneEn.includes('Needs minutes'), '纪要页的状态标签跟语言走')
+const doneCjk = (doneEn.match(/[一-鿿]/g) || []).length
+A.equal(doneCjk, 0, `会议内容全英文时纪要页不该有任何中文(有即 renderDone 硬编码漏进词表):${(doneEn.match(/.{0,14}[一-鿿]+.{0,14}/) || [''])[0]}`)
+// 切回中文:同一页原地重渲(数据不跟着翻)
+mockLocale = 'zh'
+for (const cb of localeSubs) cb('zh')
+await settle()
+const doneZh = el3.textContent
+A.ok(doneZh.includes('生成纪要') && doneZh.includes('待纪要'), '纪要页切回中文')
+A.ok(doneZh.includes('Quarterly review') && doneZh.includes('Alice, Bob'), '数据(标题/与会人)是数据,不跟着界面语言翻')
+A.equal(mount3Calls, 1, '纪要页切语言同样是原地重渲,不重挂')
+
+// fmtDate 跟语言走(zh-CN / en-US),不是恒定 ISO;时分两侧一致(排序/过期判定另走 ISO,不受影响)
+const isoD = '2026-08-14T15:30:00+08:00'
+const dObj = new Date(Date.parse(isoD))
+const hmD = `${String(dObj.getHours()).padStart(2, '0')}:${String(dObj.getMinutes()).padStart(2, '0')}`
+mockLocale = 'zh'
+const dZh = T3.fmtDate(isoD)
+mockLocale = 'en'
+const dEn = T3.fmtDate(isoD)
+A.notEqual(dEn, dZh, 'fmtDate 必须跟界面语言变')
+A.ok(/[A-Za-z]{3}/.test(dEn), `英文日期应含月份名,实得 ${dEn}`)
+A.ok(dZh.includes('月'), `中文日期应是 zh-CN 写法,实得 ${dZh}`)
+A.ok(dZh.endsWith(hmD) && dEn.endsWith(hmD), `两侧都以 HH:MM 收尾(zh=${dZh} en=${dEn})`)
+A.equal(T3.fmtDate('不是日期'), '不是日期', '非法日期原样回吐,不炸')
+
+// 分隔符按语言取:中文「、」/ 英文 ", "(⑦ 的中文残留正则是 [一-鿿],U+3001 不在区间内,只能单独钉)
+A.equal(T3.tl('zh', 'capJoin'), '、', '中文侧列表分隔符是「、」')
+A.equal(T3.tl('en', 'capJoin'), ', ', '英文侧列表分隔符是 ", ",不许硬拼中文顿号')
+for (const k of zhKeys) A.ok(!/[、。；「」]/.test(String(T.MSG.en[k])), `MSG.en.${k} 里有中文标点:${T.MSG.en[k]}`)
+// 英文侧不许出现「数字紧跟可数名词」的伪复数写法(1 segments / segment(s) 那种)
+for (const k of zhKeys) A.ok(!/\(s\)/.test(String(T.MSG.en[k])), `MSG.en.${k} 用了 (s) 括号复数,换成不需要单复数一致的写法:${T.MSG.en[k]}`)
+
+un3()
+A.equal(T3.mountedViews.size, 0, '视图卸载后从重渲名册里摘掉')
+A.doesNotThrow(() => enDispose(), '双语实例 disposer 不抛')
+A.equal(localeSubs.size, 0, 'disposer 必须退订 subscribeLocale')
+
+// ── 旧宿主(07-18 后 API 全删,**且没有 getLocale/subscribeLocale**)setup 不抛 + 缺 transcribeAudio 横幅降级 ──
 globalThis.__MEETING_TEST__ = {}
 const oldCtx = { registerCommand: () => {}, registerSetting: () => {}, app: { notify() {} } }
 let oldDispose
@@ -670,7 +845,50 @@ globalThis.__MEETING_TEST__ = T
 // ── 收尾:disposer 执行不抛 ──
 A.doesNotThrow(() => dispose(), 'disposer 执行不抛')
 
+// ── 统一左栏列表源(1.2.0):注册 + 订阅即重读 + 状态分组 + open 交给 recorder + 笔记走 loadPage ──
+// ⚠️「订阅即重读」是这条接缝的头号坑:插件在宿主**启动期**装载,那时活动库还没恢复,
+//    ctx.app.readFile 静默给 null → 列表定格为空且此后无人再喊它(青鸟 2026-08-28 实报)。
+{
+  const LS = reg.listSources.find((x) => x.id === 'meeting-list')
+  A.ok(LS, '应注册 meeting-list 列表源')
+  A.equal(reg.views.find((v) => v.id === 'recorder').workspaceSource, 'meeting-list', 'recorder 视图应声明 workspaceSource(裸源 id)')
+  const idxKey = '会议记录员/.meeting-index.json'
+  const before = V.get(idxKey)
+  V.set(idxKey, JSON.stringify({ meetings: [
+    { path: '会议记录员/2026-08-28 周会.md', title: '订阅后才读得到', date: '2026-08-28T01:00:00.000Z', status: 'done', openActions: 3 },
+    { path: '会议记录员/2026-08-27 评审.md', title: '还没出纪要', date: '2026-08-27T01:00:00.000Z', status: 'transcribed', openActions: 0 },
+  ] }))
+  A.ok(!LS.items({}).some((r) => r.key === '会议记录员/2026-08-28 周会.md'), '前提:此刻列表源还没读过这份新索引')
+  const off = LS.subscribe(() => {})
+  await new Promise((r) => setImmediate(r)) // ⚠️本文件把 setTimeout 换成了假时钟,只能用 setImmediate 让微任务跑完
+  const rows = LS.items({})
+  A.ok(rows.some((r) => r.key === '会议记录员/2026-08-28 周会.md'), 'subscribe() 必须触发一次重读,否则启动期读空的列表永远回不来')
+  A.equal(rows.length, 2, '重读后就是索引里那两行')
+  A.equal(rows[0].hint, '3', '右侧数字 = 未完成行动项数')
+  A.equal(rows[1].hint, '', '零未完成不画 0')
+  A.deepEqual(LS.items({ group: 'transcribed' }).map((r) => r.key), ['会议记录员/2026-08-27 评审.md'], '分组过滤按 status')
+  A.deepEqual(LS.items({ query: '还没' }).map((r) => r.key), ['会议记录员/2026-08-27 评审.md'], '搜索匹配标题')
+  A.deepEqual(LS.groups().map((g) => [g.key, g.count]), [['transcribed', 1], ['done', 1]], '分组=非空状态档,按 recording→transcribed→done 排')
+  A.equal(LS.groups()[1].title, '已完成', '分组标签走词表(与列表页徽章同一批键)')
+  // 右键「在笔记中打开」必须走 loadPage —— 裸 .md 给 openFile 会被系统默认程序抢走
+  navLoaded.length = 0; navOpened.length = 0
+  LS.itemMenu({ key: '会议记录员/2026-08-28 周会.md' })[0].run()
+  A.deepEqual(navLoaded, ['会议记录员/2026-08-28 周会.md'], '打开笔记必须走 loadPage')
+  A.equal(navOpened.length, 0, '一次都没调 openFile(裸 .md 会掉进系统默认程序)')
+  const opened = []
+  const realOpenView = ctx.openView
+  ctx.openView = (v) => opened.push(v)
+  LS.open({ key: '会议记录员/2026-08-28 周会.md' })
+  ctx.openView = realOpenView
+  A.deepEqual(opened, ['recorder'], 'open() 应把这场会议交给 recorder 视图')
+  A.equal(typeof off, 'function', 'subscribe() 须返回退订函数')
+  off()
+  if (before === undefined) V.delete(idxKey); else V.set(idxKey, before)
+}
+
 console.log(`check ok — ${reg.views.length} view / ${reg.commands.length} cmds / ${reg.settings.length} setting / ${reg.status.length} statusItem`)
 console.log('覆盖:段偏移合并(+300s)/ 行动项解析与勾选回写(@·📅缺省)/ 状态机 recording→transcribed→done / 模块级录音(零视图挂载)/ 双场连录重置 / 失败段占位 / ```minutes 解析与外科落盘(TOCTOU)/ 重新生成合并(勾选带过+手写行保留)/ 开录竞态(弹窗窗口期拒第二路)/ 静音段良性占位 / 收尾窗口期要点不丢 / CRLF 外科操作 / 勾选写回失败不上抛 / 行动项聚合排序·过期 / 索引自愈(孤儿+崩溃降级+瞬时读错不剔)/ XSS(Markdown+转写)/ 旧宿主降级 / 数据契约字节级往返')
 console.log("第二修复轮加钉:agent slug 不撞 20260717 老实体(目录名=slug 实读)+ 首轮产出不合约自动回退默认助手(假 fetch 断言第 2 次 POST 无 agent_config)/ 视图真实挂载('rec' 不拽回录音页·'rec-start' 才切页·收尾不传送 done)/ 轮转×手动结束撞车不丢末段(onstop 异步派发+inactive stop 抛错)/ 同文重复行动项按行号定位 / MediaRecorder 构造失败 ok:false 且状态栏不冻死 / 首装索引写竞态(串行闸)")
-console.log('真机验收项:blobToWav16kBase64 真实音频管线(此处 stub)、波形绘制、真 agent SSE 生成、麦克风权限弹窗。')
+console.log('双语轮加钉:MSG 两侧键集合相等(占位符同名同数 + 英文侧零残留中文/中文标点/(s) 括号复数)/ getLocale 返回 en 且宿主广播时同一视图不重挂即变英文 / disposer 退订 subscribeLocale')
+console.log('第三修复轮加钉:切语言不吞未提交输入(idle 标题·与会人 + rec 要点草稿)与滚动位、且 placeholder 同时已换语言 / 录音页与纪要页的英文(纪要页喂全英文会议,页面出现任何中文即判硬编码)/ fmtDate 跟语言走而排序仍用 ISO / 列表分隔符按语言取')
+console.log('真机验收项:blobToWav16kBase64 真实音频管线(此处 stub)、波形绘制、真 agent SSE 生成、麦克风权限弹窗;界面双语另跑 desktop 的 scripts/plugin-view.e2e.cjs(11 项含中英切换)。')

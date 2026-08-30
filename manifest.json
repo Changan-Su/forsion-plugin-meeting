@@ -1,9 +1,11 @@
 {
   "id": "meeting-recorder",
   "name": "会议记录员",
-  "version": "1.0.0",
+  "nameEn": "Meeting Recorder",
+  "version": "1.2.0",
   "apiVersion": 1,
   "description": "Granola 式会议记录:会中只采麦克风,MediaRecorder 分段轮转录音,每段送 Forsion 自己的语音识别(设置 → 语音)实时转写——音频转写后即弃,不落盘、不外传;你随手记的要点与完整转写落进笔记库 markdown(工作文件夹,默认「会议记录员」)。会后由本机 Tangu(随包「会议书记官」Agent)融合要点与转写生成结构化纪要与行动项;所有会议的未完成行动项跨会议聚合追踪,勾选直接回写原笔记。",
+  "descriptionEn": "Granola-style meeting notes: microphone only, recorded in rotating MediaRecorder segments, each transcribed live through Forsion's own speech recognition (Settings → Voice) — audio is discarded right after transcription, never stored or sent anywhere else; your quick notes and the full transcript land in your vault as markdown (work folder, \"会议记录员\" by default). Afterwards local Tangu (the bundled Meeting Scribe agent, listed under its Chinese name \"会议书记官\") merges notes and transcript into structured minutes plus action items; open action items from every meeting are tracked in one place, and ticking one writes straight back to its source note.",
   "main": "main.js",
   "events": [
     { "name": "meeting_recorded", "label": "会议录音完成" },
@@ -25,6 +27,23 @@
         "description": "点「结束录音」完成剩余分段转写,再点「生成纪要」:AI 只根据你的要点与转写产出纪要 + 行动项(行格式 - [ ] 内容 @负责人 📅日期,绝不发明决议)。「行动项总览」跨会议聚合未完成项,按截止日排序、过期红标,勾选直接回写原笔记。注意:只采集麦克风、不保存音频原文件、关闭应用即结束录音。"
       }
     ],
+    "en": {
+      "intro": "Record the meeting while you capture quick notes, transcribed live segment by segment; afterwards AI merges your notes with the full transcript into structured minutes and action items. The companion Meeting Scribe agent (listed under its Chinese name \"会议书记官\") ships inside this bundle and is seeded automatically when the engine starts — nothing else to install.",
+      "steps": [
+        {
+          "title": "Speech recognition and microphone access",
+          "description": "Transcription rides Forsion's own voice pipeline: pick a recognition model under Settings → Voice (offline SenseVoice / bring-your-own-key provider / Forsion cloud) — this plugin needs zero ASR configuration. The first time you hit Start recording the system asks for microphone permission (macOS: System Settings › Privacy & Security › Microphone)."
+        },
+        {
+          "title": "Run a meeting",
+          "description": "Open the workbench from the command palette (\"Meeting Recorder: Open\"), fill in title and attendees, hit Start recording — or jump straight in with \"Meeting Recorder: Start recording now\". During the meeting the left column shows the live transcript (each segment is saved as soon as it is transcribed) and the right column takes your notes (Enter captures one, timestamped automatically). Closing the view does not stop the recording: the status bar keeps the \"● Recording\" timer."
+        },
+        {
+          "title": "Minutes and action items afterwards",
+          "description": "Stop recording to finish the remaining segments, then hit Generate minutes: the AI works only from your notes and the transcript (action lines are - [ ] task @owner 📅date, and it never invents decisions). \"All action items\" gathers every open item across meetings, sorted by due date with overdue ones flagged, and ticking one writes back to its source note. Note: microphone only, no audio file is kept, and quitting the app ends the recording."
+        }
+      ]
+    },
     "settings": true
   }
 }

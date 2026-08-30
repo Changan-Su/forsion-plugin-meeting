@@ -12,16 +12,291 @@
  * 录音状态全在模块级(bluebird 队列同款「不绑视图闭包」手法):关视图不断录,状态栏见「● 录音中」。
  * 安全:一切模型/用户/ASR 产出的文本只走 createElement+textContent(自建 renderMarkdown),
  * innerHTML 仅用于编译期静态模板字面量。主题吃宿主 token,浮层挂自己的 .mt-layer。
+ * 双语:一份 MSG(zh/en 键集合完全相等),ctx.getLocale() 取值 + ctx.subscribeLocale() 跟变化 ——
+ * 切语言时视图**不重挂**也原地重渲成英文;笔记正文/节名/工作文件夹名是数据契约,永不随语言变。
  */
 const PLUGIN_ID = 'meeting-recorder'
 // slug 带插件前缀 = agents/ 子目录名。绝不能叫 meeting-scribe:20260717 内容包有同名异契约老 agent
 // (读模板出「# 会议纪要 + 表格行动项」,不吐 ```minutes 围栏),播种「已存在则保留」,撞车即永久劫持。
 const AGENT_SLUG = 'meeting-recorder-scribe'
 const APP_ID = 'tangu'
+// 工作文件夹名与四个节名是**数据契约**,绝不随语言变(否则切个语言像换了数据目录 / 读不回旧文件)
 const DEFAULT_FOLDER = '会议记录员'
 const SECTION_NAMES = ['要点速记', '转写', '纪要', '行动项']
 
-ctx.registerSetting({ key: 'segmentMinutes', label: '转写分段时长(分钟)', type: 'number', default: 5, min: 2, max: 15, description: '录音每 N 分钟切一段送转写(2-15 夹取)。段越短实时转写越跟手;段越长转写调用越少。' })
+// ══ 双语词表(zh/en 两侧键集合必须完全相等,check.mjs 有断言) ══════════════════
+// 只翻 UI 文案;笔记正文/节名/frontmatter 键/工作文件夹名/行动项行格式一律不翻(数据契约)。
+const MSG = {
+  zh: {
+    // 注册面(宿主贡献点标题是单字符串,注册时定格 —— 切语言后要重启才跟上,见 README)
+    setSegLabel: '转写分段时长(分钟)',
+    setSegDesc: '录音每 N 分钟切一段送转写(2-15 夹取)。段越短实时转写越跟手;段越长转写调用越少。',
+    viewTitle: '会议记录员',
+    cmdOpen: '会议记录员:打开',
+    cmdStart: '会议记录员:立即开始录音',
+    // 状态栏
+    sbIdle: '🎙 会议',
+    sbTitle: '会议记录员',
+    sbRecording: '● 录音中 {time}',
+    sbRecTitle: '会议记录员:录音中,点击查看',
+    sbClickTitle: '会议记录员:点击查看',
+    sbWrapUp: '● 完成转写中…',
+    // 能力检查
+    capMic: '麦克风采集(navigator.mediaDevices)',
+    capRec: '录音器(MediaRecorder)',
+    capAsr: '语音识别桥(window.tangu.transcribeAudio;需 Forsion 桌面端,并在 设置 → 语音 配好识别模型)',
+    capReason: '当前环境缺少:{miss}。录音功能不可用;已有会议的浏览与纪要生成不受影响。',
+    capJoin: '、',
+    // 录音
+    errSaveFailed: '落盘失败:{err}',
+    warnBusy: '已有一场录音在进行中',
+    errMicDenied: '麦克风权限被拒绝(打开 系统设置 › 隐私与安全 › 麦克风,允许本 App)',
+    errMicNotFound: '没检测到麦克风设备',
+    errMicOpen: '麦克风打不开:{err}',
+    defaultMeetingTitle: '即时会议',
+    errRecorderStart: '录音器启动失败',
+    errRecorderStartDetail: '录音器启动失败:{err}',
+    segNoSpeech: '(第 {n} 段未识别到语音)',
+    segFailedLine: '(第 {n} 段转写失败:{err})',
+    errAsrBridge: '语音识别桥不可用',
+    errNoAudioDecode: '当前环境没有音频解码能力(AudioContext 缺失)',
+    recDone: '录音结束,转写完成',
+    recDoneWithFails: '录音结束,转写完成({n} 段失败,已在转写里标注占位)',
+    // 纪要生成
+    genRunning: '这场会议的纪要正在生成中',
+    errReadMeeting: '读不到会议文件(可能已被移动或删除)',
+    errReadMeetingShort: '读不到会议文件',
+    warnEmptyMeeting: '这场会议既没有要点也没有转写内容,没法生成纪要',
+    errNeedLogin: '请先登录 Forsion',
+    errNoEngine: '未连接到 Tangu 引擎(需 Forsion 桌面端)',
+    stageSubmit: '提交任务',
+    stageQueued: '排队中',
+    stagePrepare: '准备中',
+    stageWriting: '生成纪要中',
+    stageFinished: '完成',
+    stageFallback: '回退默认助手重试',
+    stageBadFormat: '产出不合约,回退默认助手重试',
+    errRunStart: '起 run 失败 HTTP {code}',
+    errNoRunId: '引擎未返回 runId',
+    errSubscribe: '订阅事件失败 HTTP {code}',
+    errGenerate: '生成失败',
+    errStreamCut: '与引擎的连接中断,未收到完成事件(可重试)',
+    errNoMinutesBlock: '模型没有按约定返回 ```minutes 代码块,请重试一次',
+    errFileGoneDuringGen: '会议文件在生成期间被移动或删除,纪要未写入',
+    okMinutes: '纪要已生成',
+    errMinutesFailed: '纪要生成失败:{err}',
+    // 行动项
+    warnActionLineGone: '没找到这一行行动项(文件可能已被编辑),已刷新列表',
+    errToggleSave: '勾选没写回(保存失败):{err}',
+    errToggle: '勾选失败:{err}',
+    // idle 页
+    heroTitle: '会议记录员',
+    heroSub: '会中录音 + 随手记要点,分段实时转写;会后 AI 融合出结构化纪要与行动项。',
+    phTitle: '会议标题(留空 = 即时会议)',
+    phAttendees: '与会人,逗号分隔(可选,如:张三, 李四)',
+    segHint: '每 {n} 分钟一段送转写(插件设置可调)',
+    btnStart: '开始录音',
+    btnStarting: '正在打开麦克风…',
+    privacyNote: '只采集麦克风;音频分段转写后即弃、不保存原始录音;关闭应用会直接结束录音。',
+    btnBackToRec: '回到录音',
+    tabMeetings: '会议列表',
+    tabAllActions: '行动项总览',
+    loading: '加载中…',
+    emptyMeetings: '还没有会议记录。填好标题点「开始录音」,要点、完整转写与 AI 纪要都会存进你的笔记库。',
+    emptyAllActions: '没有未完成的行动项。生成纪要后,各场会议的 - [ ] 待办会聚合到这里,按截止日排序、过期红标。',
+    untitledMeeting: '(未命名会议)',
+    stRecording: '● 录音中',
+    stNeedsMinutes: '待纪要',
+    stDone: '已完成',
+    openActions: '{n} 项待办',
+    idleWrapUp: '完成转写中…',
+    chipDue: '📅 {due}',
+    chipDueOverdue: '📅 {due} 已过期',
+    tipOpenMeeting: '打开这场会议',
+    // rec 页
+    btnBack: '← 返回',
+    btnStop: '结束录音',
+    labLiveTranscript: '实时转写',
+    labBullets: '要点速记',
+    phBullet: '记要点,Enter 落一条(自动带相对时间戳)…',
+    recFooter: '关掉这个视图录音也不断(状态栏可见);关闭应用 = 结束录音。',
+    liveEmpty: '第一段转写完成后出现在这里(每 {n} 分钟一段)…',
+    confirmStopTitle: '结束录音?',
+    confirmStopDesc: '结束后会完成剩余分段的转写,然后可一键生成纪要。',
+    warnBulletLost: '这条要点没记上:录音已结束(可复制到笔记里)',
+    segNo: '第 {n} 段',
+    segDoneCount: '已转写 {n} 段',
+    segPendingCount: '{n} 段转写中',
+    segFailedCount: '{n} 段失败',
+    segWrapUp: '正在收尾…',
+    // done 页
+    btnCopy: '复制',
+    btnExport: '导出 MD',
+    btnOpenNote: '在笔记中打开',
+    tabMinutes: '纪要',
+    tabTranscript: '转写',
+    tabActions: '行动项',
+    labMinutes: '会议纪要',
+    btnGen: '生成纪要',
+    btnRegen: '重新生成',
+    btnGenning: '生成中…',
+    stRecCrashed: '录音未正常收尾',
+    okCopied: '已复制整篇会议 Markdown',
+    errCopy: '复制失败',
+    exportFallbackName: '会议.md',
+    warnNoOpenFile: '当前宿主不支持直接打开笔记',
+    minutesReady: '转写已就绪。点「生成纪要」,AI 会把你的要点与完整转写融合成结构化纪要 + 行动项(只取会上说过的,不发明决议)。',
+    minutesNoSource: '这场会议没有要点与转写内容。',
+    emptyTranscript: '没有转写内容。',
+    emptyMeetingActions: '还没有行动项。生成纪要时会按「- [ ] 内容 @负责人 📅日期」自动提取。',
+    genProgress: '{label} · 已产出 {n} 字',
+    genFailed: '生成失败:{err}',
+    errExport: '导出失败:{err}',
+    // 确认框 / 命令
+    btnCancel: '取消',
+    btnOk: '确定',
+    warnOldHostView: '当前宿主版本过旧,不支持工作台视图',
+    infoAlreadyRecording: '已经在录音中',
+    // 注入模型的语言指示(指令段本身恒英文,只有目标语言随界面语言变)
+    promptLang: 'Chinese',
+  },
+  en: {
+    setSegLabel: 'Transcription segment length (minutes)',
+    setSegDesc: 'Rotate the recorder every N minutes and transcribe that segment (clamped to 2-15). Shorter segments feel more live; longer ones mean fewer transcription calls.',
+    viewTitle: 'Meeting Recorder',
+    cmdOpen: 'Meeting Recorder: Open',
+    cmdStart: 'Meeting Recorder: Start recording now',
+    sbIdle: '🎙 Meeting',
+    sbTitle: 'Meeting Recorder',
+    sbRecording: '● Recording {time}',
+    sbRecTitle: 'Meeting Recorder: recording — click to open',
+    sbClickTitle: 'Meeting Recorder: click to open',
+    sbWrapUp: '● Finishing transcription…',
+    capMic: 'microphone capture (navigator.mediaDevices)',
+    capRec: 'audio recorder (MediaRecorder)',
+    capAsr: 'the speech recognition bridge (window.tangu.transcribeAudio — needs the Forsion desktop app with a model picked in Settings → Voice)',
+    capReason: 'This environment is missing: {miss}. Recording is unavailable; browsing past meetings and generating minutes still work.',
+    capJoin: ', ',
+    errSaveFailed: 'Save failed: {err}',
+    warnBusy: 'A recording is already running',
+    errMicDenied: 'Microphone permission denied (allow this app under System Settings › Privacy & Security › Microphone)',
+    errMicNotFound: 'No microphone detected',
+    errMicOpen: 'Could not open the microphone: {err}',
+    defaultMeetingTitle: 'Quick meeting',
+    errRecorderStart: 'Recorder failed to start',
+    errRecorderStartDetail: 'Recorder failed to start: {err}',
+    segNoSpeech: '(no speech detected in segment {n})',
+    segFailedLine: '(segment {n} failed to transcribe: {err})',
+    errAsrBridge: 'Speech recognition bridge unavailable',
+    errNoAudioDecode: 'This environment cannot decode audio (AudioContext missing)',
+    recDone: 'Recording stopped — transcription complete',
+    // 英文侧一律避开「数字 + 可数名词」的单复数一致(1 segments failed 那种):改成冒号计数,任何 n 都成立
+    recDoneWithFails: 'Recording stopped — transcription complete (failed segments: {n}; placeholders left in the transcript)',
+    genRunning: 'Minutes for this meeting are already being generated',
+    errReadMeeting: 'Cannot read the meeting file (it may have been moved or deleted)',
+    errReadMeetingShort: 'Cannot read the meeting file',
+    warnEmptyMeeting: 'This meeting has neither notes nor a transcript — nothing to build minutes from',
+    errNeedLogin: 'Sign in to Forsion first',
+    errNoEngine: 'Not connected to the Tangu engine (requires the Forsion desktop app)',
+    stageSubmit: 'Submitting',
+    stageQueued: 'Queued',
+    stagePrepare: 'Preparing',
+    stageWriting: 'Writing minutes',
+    stageFinished: 'Done',
+    stageFallback: 'Retrying with the default assistant',
+    stageBadFormat: 'Unexpected output format — retrying with the default assistant',
+    errRunStart: 'Could not start the run (HTTP {code})',
+    errNoRunId: 'The engine returned no runId',
+    errSubscribe: 'Could not subscribe to events (HTTP {code})',
+    errGenerate: 'Generation failed',
+    errStreamCut: 'Connection to the engine dropped before the run finished (safe to retry)',
+    errNoMinutesBlock: 'The model did not return the agreed ```minutes block — please try once more',
+    errFileGoneDuringGen: 'The meeting file was moved or deleted while generating — minutes were not written',
+    okMinutes: 'Minutes generated',
+    errMinutesFailed: 'Could not generate minutes: {err}',
+    warnActionLineGone: 'That action item line is gone (the file was edited) — list refreshed',
+    errToggleSave: 'Checkbox not written back (save failed): {err}',
+    errToggle: 'Could not update the checkbox: {err}',
+    heroTitle: 'Meeting Recorder',
+    heroSub: 'Record and capture notes during the meeting with live segment transcription; afterwards AI merges both into structured minutes and action items.',
+    phTitle: 'Meeting title (blank = quick meeting)',
+    phAttendees: 'Attendees, comma separated (optional, e.g. Alex, Sam)',
+    segHint: 'Transcribed every {n} min (adjustable in plugin settings)',
+    btnStart: 'Start recording',
+    btnStarting: 'Opening microphone…',
+    privacyNote: 'Microphone only; each audio segment is discarded once transcribed — no audio file is kept; quitting the app ends the recording.',
+    btnBackToRec: 'Back to recording',
+    tabMeetings: 'Meetings',
+    tabAllActions: 'All action items',
+    loading: 'Loading…',
+    emptyMeetings: 'No meetings yet. Add a title, hit Start recording — your notes, the full transcript and the AI minutes all land in your vault.',
+    emptyAllActions: 'No open action items. Once minutes are generated, every - [ ] item across meetings shows up here, sorted by due date with overdue ones flagged.',
+    untitledMeeting: '(untitled meeting)',
+    stRecording: '● Recording',
+    stNeedsMinutes: 'Needs minutes',
+    stDone: 'Done',
+    openActions: '{n} to do', // 徽标紧挨 Needs minutes / Done,光写 '{n} open' 太含糊;'to do' 还避开单复数
+    idleWrapUp: 'Finishing transcription…',
+    chipDue: '📅 {due}',
+    chipDueOverdue: '📅 {due} overdue',
+    tipOpenMeeting: 'Open this meeting',
+    btnBack: '← Back',
+    btnStop: 'Stop recording',
+    labLiveTranscript: 'Live transcript',
+    labBullets: 'Live notes',
+    phBullet: 'Capture a note, Enter to save (timestamped automatically)…',
+    recFooter: 'Recording keeps going if you close this view (watch the status bar); quitting the app ends it.',
+    liveEmpty: 'The first segment shows up here once transcribed (one every {n} min)…',
+    confirmStopTitle: 'Stop recording?',
+    confirmStopDesc: 'Remaining segments finish transcribing, then you can generate the minutes in one click.',
+    warnBulletLost: 'Note not captured — the recording had already ended (copy it into your notes)',
+    segNo: 'Segment {n}',
+    segDoneCount: '{n} transcribed',
+    segPendingCount: '{n} transcribing',
+    segFailedCount: '{n} failed',
+    segWrapUp: 'Wrapping up…',
+    btnCopy: 'Copy',
+    btnExport: 'Export MD',
+    btnOpenNote: 'Open in notes',
+    tabMinutes: 'Minutes',
+    tabTranscript: 'Transcript',
+    tabActions: 'Action items',
+    labMinutes: 'Meeting minutes',
+    btnGen: 'Generate minutes',
+    btnRegen: 'Regenerate',
+    btnGenning: 'Generating…',
+    stRecCrashed: 'Recording never finished cleanly',
+    okCopied: 'Copied the whole meeting as Markdown',
+    errCopy: 'Copy failed',
+    exportFallbackName: 'meeting.md',
+    warnNoOpenFile: 'This host cannot open notes directly',
+    minutesReady: 'Transcript ready. Hit Generate minutes and the AI merges your notes with the full transcript into structured minutes plus action items — only what was actually said, never invented decisions.',
+    minutesNoSource: 'This meeting has no notes and no transcript.',
+    emptyTranscript: 'No transcript.',
+    emptyMeetingActions: 'No action items yet. Generating minutes picks up lines shaped like "- [ ] task @owner 📅date".',
+    genProgress: '{label} · {n} chars so far',
+    genFailed: 'Generation failed: {err}',
+    errExport: 'Export failed: {err}',
+    btnCancel: 'Cancel',
+    btnOk: 'OK',
+    warnOldHostView: 'This host is too old to show workbench views',
+    infoAlreadyRecording: 'Already recording',
+    promptLang: 'English',
+  },
+}
+/** 当前语言:旧宿主缺 getLocale → 回退中文(canonical)。 */
+const L = () => {
+  try { return ctx.getLocale && ctx.getLocale() === 'en' ? 'en' : 'zh' } catch { return 'zh' }
+}
+function tl(loc, k, vars) {
+  const d = MSG[loc] || MSG.zh
+  let s = d[k] != null ? d[k] : (MSG.zh[k] != null ? MSG.zh[k] : k)
+  if (vars) for (const n of Object.keys(vars)) s = s.split('{' + n + '}').join(String(vars[n]))
+  return s
+}
+function t(k, vars) { return tl(L(), k, vars) }
+
+ctx.registerSetting({ key: 'segmentMinutes', label: t('setSegLabel'), type: 'number', default: 5, min: 2, max: 15, description: t('setSegDesc') })
 
 // ── 纯函数(经文末 __MEETING_TEST__ 暴露给 check.mjs) ────────────────────────
 
@@ -42,11 +317,18 @@ function fmtBullet(sec) {
 }
 function localDate(ms) { const d = new Date(ms); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}` }
 const todayStr = () => localDate(Date.now())
+/** 会议卡片上的日期:跟界面语言走(zh-CN / en-US);Intl 缺席时回退 ISO 风格。 */
 function fmtDate(iso) {
-  const t = Date.parse(String(iso || ''))
-  if (Number.isNaN(t)) return String(iso || '')
-  const d = new Date(t)
-  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`
+  const ms = Date.parse(String(iso || ''))
+  if (Number.isNaN(ms)) return String(iso || '')
+  const d = new Date(ms)
+  const plain = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`
+  try {
+    const loc = L() === 'zh' ? 'zh-CN' : 'en-US'
+    const day = d.toLocaleDateString(loc, { year: 'numeric', month: 'short', day: 'numeric' })
+    const hm = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`
+    return `${day} ${hm}`
+  } catch { return plain }
 }
 function slugify(title) {
   const s = String(title || '').replace(/[\\/:*?"<>|#^[\]{}]/g, '').trim().replace(/\s+/g, '-').slice(0, 40)
@@ -338,16 +620,16 @@ async function getCfg() {
 }
 async function runAgent(cfg, sessionId, message, agentSlug, onTick, signal, onStage) {
   const stage = (s) => { if (onStage) onStage(s) }
-  stage('提交任务')
+  stage(t('stageSubmit'))
   const h = { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.token}` }
   const reqBody = { session_id: sessionId, model_id: cfg.modelId || undefined, app_id: APP_ID, message, attachments: [] }
   if (agentSlug) reqBody.agent_config = { agentSlug }
   const start = await fetch(`${cfg.backendUrl}/agent/runs`, { method: 'POST', headers: h, signal, body: JSON.stringify(reqBody) })
-  if (!start.ok) throw new Error((await start.text().catch(() => '')) || `起 run 失败 HTTP ${start.status}`)
+  if (!start.ok) throw new Error((await start.text().catch(() => '')) || t('errRunStart', { code: start.status }))
   const { runId } = await start.json()
-  if (!runId) throw new Error('引擎未返回 runId')
+  if (!runId) throw new Error(t('errNoRunId'))
   const res = await fetch(`${cfg.backendUrl}/agent/runs/${encodeURIComponent(runId)}/events?fromSeq=0`, { headers: h, signal })
-  if (!res.ok || !res.body) throw new Error(`订阅事件失败 HTTP ${res.status}`)
+  if (!res.ok || !res.body) throw new Error(t('errSubscribe', { code: res.status }))
   const reader = res.body.getReader(), dec = new TextDecoder()
   let buf = '', lastSeq = 0, content = ''
   while (true) {
@@ -364,17 +646,17 @@ async function runAgent(cfg, sessionId, message, agentSlug, onTick, signal, onSt
       let ev
       try { ev = JSON.parse(data) } catch { continue }
       if (typeof ev.seq === 'number') { if (ev.seq <= lastSeq) continue; lastSeq = ev.seq }
-      if (ev.type === 'status') { stage(ev.payload && ev.payload.state === 'queued' ? '排队中' : '准备中'); continue }
+      if (ev.type === 'status') { stage(ev.payload && ev.payload.state === 'queued' ? t('stageQueued') : t('stagePrepare')); continue }
       if (ev.type === 'token') {
         const d = ev.payload && ev.payload.delta
-        if (d) { content += d; stage('生成纪要中'); if (onTick) onTick(content) }
+        if (d) { content += d; stage(t('stageWriting')); if (onTick) onTick(content) }
         continue
       }
-      if (ev.type === 'done') { stage('完成'); return (ev.payload && ev.payload.content) || content }
-      if (ev.type === 'error') throw new Error((ev.payload && ev.payload.error) || '生成失败')
+      if (ev.type === 'done') { stage(t('stageFinished')); return (ev.payload && ev.payload.content) || content }
+      if (ev.type === 'error') throw new Error((ev.payload && ev.payload.error) || t('errGenerate'))
     }
   }
-  throw new Error('与引擎的连接中断,未收到完成事件(可重试)')
+  throw new Error(t('errStreamCut'))
 }
 /** 注入模型的指令一律英文(语言纪律);格式字面量(## 纪要 等)是钉死的数据契约,原样给出。 */
 function buildMinutesPrompt(m) {
@@ -386,7 +668,7 @@ Hard rules:
 - Every statement must come from the bullets or the transcript. Never invent decisions, numbers, dates, or facts.
 - Assign an action-item owner only when that exact name appears in the bullets, transcript, or attendee list; when unsure, omit the owner.
 - Include a due date only when one is explicitly mentioned; resolve relative dates against the meeting date below.
-- Write the minutes in the same language as the transcript/bullets (Chinese content means Chinese minutes).
+- Write the minutes in the same language as the transcript/bullets (Chinese content means Chinese minutes); when the source language is mixed or ambiguous, write them in ${t('promptLang')}.
 - Leading timestamps (MM:SS in bullets, [HH:MM:SS] in the transcript) are elapsed time from meeting start.
 
 Output EXACTLY ONE fenced code block tagged "minutes" and nothing else. Do NOT put any nested code fences inside it. Format:
@@ -438,7 +720,7 @@ function wavBase64(pcm, sampleRate) {
 const hooks = {
   wav: async function blobToWav16kBase64(blob) {
     const AC = globalThis.AudioContext || globalThis.webkitAudioContext
-    if (!AC || !globalThis.OfflineAudioContext) throw new Error('当前环境没有音频解码能力(AudioContext 缺失)')
+    if (!AC || !globalThis.OfflineAudioContext) throw new Error(t('errNoAudioDecode'))
     const arrayBuf = await blob.arrayBuffer()
     const ac = new AC()
     let decoded
@@ -543,6 +825,17 @@ async function uniqueMeetingPath(title, nowMs) {
 // ── 跨视图小总线 ─────────────────────────────────────────────────────────────
 
 const bus = (() => { const subs = new Set(); return { on: (f) => (subs.add(f), () => subs.delete(f)), emit: (e) => subs.forEach((f) => { try { f(e) } catch { /* ignore */ } }) } })()
+let pendingOpen = null // 统一左栏点行 → recorder 挂载时消费(与 rec-done 同一条路)
+/** 打开会议纪要那篇**裸 `.md`** —— 一律 `loadPage`,**不许用 `openFile`**。
+ *  宿主 `openFile` 只认插件注册过的后缀与内置那几类,裸 `.md` 会落 `amadeus.openVaultFile()`
+ *  = 交给系统默认程序,纪要会在 TextEdit 里打开(readflow 1.1.2 踩过的同一条生态级 P0-A;
+ *  本插件 manifest 没有 fileExtensions,产物全是裸 .md,一处不漏地踩中)。 */
+function openNotePath(path) {
+  if (!path) return
+  if (ctx.app && typeof ctx.app.loadPage === 'function') { ctx.app.loadPage(path); return }
+  if (ctx.app && typeof ctx.app.openFile === 'function') ctx.app.openFile(path) // 老宿主兜底
+  else say(t('warnNoOpenFile'), { level: 'warning' })
+}
 const say = (m, o) => (ctx.notify ? ctx.notify(m, o) : ctx.app.notify(m))
 
 // ── 录音引擎(全模块级:关视图不断录;dispose 才收) ──────────────────────────
@@ -571,24 +864,35 @@ function capability() {
   const hasAsr = !!(globalThis.window && window.tangu && window.tangu.transcribeAudio)
   if (hasMic && hasRec && hasAsr) return { ok: true, reason: '' }
   const miss = []
-  if (!hasMic) miss.push('麦克风采集(navigator.mediaDevices)')
-  if (!hasRec) miss.push('录音器(MediaRecorder)')
-  if (!hasAsr) miss.push('语音识别桥(window.tangu.transcribeAudio;需 Forsion 桌面端,并在 设置 → 语音 配好识别模型)')
-  return { ok: false, reason: `当前环境缺少:${miss.join('、')}。录音功能不可用;已有会议的浏览与纪要生成不受影响。` }
+  if (!hasMic) miss.push(t('capMic'))
+  if (!hasRec) miss.push(t('capRec'))
+  if (!hasAsr) miss.push(t('capAsr'))
+  return { ok: false, reason: t('capReason', { miss: miss.join(t('capJoin')) }) }
 }
 async function writeRecDraft() {
   // finalized 后禁写:收尾终稿(mt_status: transcribed)落盘之后,迟到的草稿写会把状态倒回 recording
   if (!recState.path || !recState.meeting || recState.finalized) return
   try { await ctx.app.writeFile(recState.path, serializeMeeting(recState.meeting)) }
-  catch (e) { recState.error = '落盘失败:' + ((e && e.message) || e) }
+  catch (e) { recState.error = t('errSaveFailed', { err: (e && e.message) || e }) }
+}
+/** 状态栏文案单点:录音态 + 当前语言都从这里读(切语言时也重刷一次,不必等下一个秒表 tick)。 */
+function syncStatusBar() {
+  if (!sb || !sb.update) return
+  if (recState.active) {
+    const sec = recState.startedAt ? Math.max(0, Math.round((Date.now() - recState.startedAt) / 1000)) : 0
+    sb.update({ text: t('sbRecording', { time: fmtBullet(sec) }), title: t('sbRecTitle') })
+    return
+  }
+  if (recState.stopping) { sb.update({ text: t('sbWrapUp'), title: t('sbClickTitle') }); return }
+  sb.update({ text: t('sbIdle'), title: t('sbTitle') })
 }
 /** 开录进行中闸(权限弹窗可开着好几秒):入口即置位,双路并发第二路直接拒,绝不等 await 之后才裁决。 */
 let recStarting = false
 /** 插件已停用标记:等权限/等路径期间被 dispose,继续开录就是收不掉的孤儿热麦克风,必须半路刹车。 */
 let pluginDisposed = false
-const stopTracks = (s) => { if (s && s.getTracks) { try { s.getTracks().forEach((t) => t.stop()) } catch { /* ignore */ } } }
+const stopTracks = (s) => { if (s && s.getTracks) { try { s.getTracks().forEach((tk) => tk.stop()) } catch { /* ignore */ } } }
 async function startRecording(title, attendees) {
-  if (recStarting || recState.active || recState.stopping || pluginDisposed) { say('已有一场录音在进行中', { level: 'warning' }); return { ok: false, error: 'busy' } }
+  if (recStarting || recState.active || recState.stopping || pluginDisposed) { say(t('warnBusy'), { level: 'warning' }); return { ok: false, error: 'busy' } }
   const cap = capability()
   if (!cap.ok) { say(cap.reason, { level: 'error' }); return { ok: false, error: cap.reason } }
   recStarting = true
@@ -597,9 +901,9 @@ async function startRecording(title, attendees) {
     try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }) }
     catch (e) {
       const name = e && e.name
-      const msg = name === 'NotAllowedError' ? '麦克风权限被拒绝(打开 系统设置 › 隐私与安全 › 麦克风,允许本 App)'
-        : name === 'NotFoundError' ? '没检测到麦克风设备'
-          : `麦克风打不开:${name || (e && e.message) || e}`
+      const msg = name === 'NotAllowedError' ? t('errMicDenied')
+        : name === 'NotFoundError' ? t('errMicNotFound')
+          : t('errMicOpen', { err: name || (e && e.message) || e })
       say(msg, { level: 'error' })
       return { ok: false, error: msg }
     }
@@ -608,7 +912,7 @@ async function startRecording(title, attendees) {
     resetRecState()
     const now = Date.now()
     const meeting = {
-      title: String(title || '').trim() || '即时会议', dateIso: new Date(now).toISOString(), status: 'recording',
+      title: String(title || '').trim() || t('defaultMeetingTitle'), dateIso: new Date(now).toISOString(), status: 'recording',
       attendees: String(attendees || '').trim(), fmExtra: [], bullets: [], transcript: [], minutes: '', actions: [],
     }
     let path
@@ -634,7 +938,7 @@ async function startRecording(title, attendees) {
     if (!startSegment()) {
       // MediaRecorder 构造失败:绝不报 ok:true 留一个空转会话 + 冻死的「● 录音中 00:00」状态栏。
       // 已落盘的空草稿降级 transcribed(与崩溃自愈同款结局),状态栏复位,报真实错误。
-      const err = recState.error || '录音器启动失败'
+      const err = recState.error || t('errRecorderStart')
       releaseMedia()
       const failedMeeting = recState.meeting, failedPath = recState.path
       if (failedMeeting) {
@@ -643,12 +947,12 @@ async function startRecording(title, attendees) {
         try { await upsertIndex(failedPath, failedMeeting) } catch { /* 打开时自愈 */ }
       }
       resetRecState()
-      if (sb && sb.update) sb.update({ text: '🎙 会议', title: '会议记录员' })
+      syncStatusBar()
       say(err, { level: 'error' })
       return { ok: false, error: err }
     }
     tickLoop()
-    if (sb && sb.update) sb.update({ text: '● 录音中 00:00', title: '会议记录员:录音中,点击查看' })
+    syncStatusBar()
     bus.emit({ type: 'rec-start' }) // 一次性「开录了」事件:视图切进录音页只认它;周期性 'rec' 只刷数据
     return { ok: true, path }
   } finally { recStarting = false }
@@ -659,7 +963,7 @@ function startSegment() {
   const MR = globalThis.MediaRecorder
   let r
   try { r = new MR(recState.stream) } catch (e) {
-    recState.error = '录音器启动失败:' + ((e && e.message) || e)
+    recState.error = t('errRecorderStartDetail', { err: (e && e.message) || e })
     return false
   }
   recState.recorder = r
@@ -700,22 +1004,22 @@ async function transcribeSegment(segNo, offsetSec, blob) {
     const b64 = await hooks.wav(blob)
     if (b64 == null) {
       // 静音段(hooks.wav 电平检测):良性占位,不送转写、不计失败
-      if (meeting) insertTranscript(meeting, [{ t: offsetSec, text: `(第 ${segNo} 段未识别到语音)` }])
+      if (meeting) insertTranscript(meeting, [{ t: offsetSec, text: t('segNoSpeech', { n: segNo }) }])
       recState.doneSegs++
     } else {
-      const t = globalThis.window && window.tangu && window.tangu.transcribeAudio
-      if (!t) throw new Error('语音识别桥不可用')
-      const res = await t({ audioBase64: b64, mime: 'audio/wav', timestamps: true })
+      const asr = globalThis.window && window.tangu && window.tangu.transcribeAudio
+      if (!asr) throw new Error(t('errAsrBridge'))
+      const res = await asr({ audioBase64: b64, mime: 'audio/wav', timestamps: true })
       const lines = mergeSegments(res, offsetSec)
       if (meeting) {
         if (lines.length) insertTranscript(meeting, lines)
-        else insertTranscript(meeting, [{ t: offsetSec, text: `(第 ${segNo} 段未识别到语音)` }])
+        else insertTranscript(meeting, [{ t: offsetSec, text: t('segNoSpeech', { n: segNo }) }])
       }
       recState.doneSegs++
     }
   } catch (e) {
     recState.failedSegs++
-    if (meeting) insertTranscript(meeting, [{ t: offsetSec, text: `(第 ${segNo} 段转写失败:${(e && e.message) || e})` }])
+    if (meeting) insertTranscript(meeting, [{ t: offsetSec, text: t('segFailedLine', { n: segNo, err: (e && e.message) || e }) }])
   }
   recState.pending--
   await writeRecDraft() // 每段转写完成即落盘:崩溃最多丢当前段
@@ -749,7 +1053,7 @@ async function finishRecording() {
 function releaseMedia() {
   const s = recState.stream
   recState.stream = null
-  if (s && s.getTracks) { try { s.getTracks().forEach((t) => t.stop()) } catch { /* ignore */ } }
+  if (s && s.getTracks) { try { s.getTracks().forEach((tk) => tk.stop()) } catch { /* ignore */ } }
   const ac = recState.audioCtx
   recState.audioCtx = null
   recState.analyser = null
@@ -768,8 +1072,8 @@ async function maybeFinalize() {
     } catch { /* 打开时自愈 */ }
   }
   recState.stopping = false
-  if (sb && sb.update) sb.update({ text: '🎙 会议', title: '会议记录员' })
-  say(recState.failedSegs ? `录音结束,转写完成(${recState.failedSegs} 段失败,已在转写里标注占位)` : '录音结束,转写完成', { level: recState.failedSegs ? 'warning' : 'success' })
+  syncStatusBar()
+  say(recState.failedSegs ? t('recDoneWithFails', { n: recState.failedSegs }) : t('recDone'), { level: recState.failedSegs ? 'warning' : 'success' })
   if (ctx.activity && ctx.activity.log) ctx.activity.log('meeting_recorded', { title: meeting ? meeting.title : '' })
   bus.emit({ type: 'rec-done', path })
 }
@@ -789,13 +1093,10 @@ function tickLoop() {
   const step = () => {
     if (!recState.active && !recState.stopping) {
       // 退出前把状态栏复位一次:任何路径漏掉复位也不许把「● 录音中」冻死在状态栏
-      if (sb && sb.update) sb.update({ text: '🎙 会议', title: '会议记录员' })
+      syncStatusBar()
       return
     }
-    if (sb && sb.update) {
-      const sec = recState.startedAt ? Math.max(0, Math.round((Date.now() - recState.startedAt) / 1000)) : 0
-      sb.update({ text: recState.active ? `● 录音中 ${fmtBullet(sec)}` : '● 完成转写中…', title: '会议记录员:点击查看' })
-    }
+    syncStatusBar()
     bus.emit({ type: 'tick' })
     recState.tickTimer = setTimeout(step, 1000)
   }
@@ -807,21 +1108,21 @@ function tickLoop() {
 const gen = new Map() // path → { status:'running'|'error', label, text, error, controller }
 async function generateMinutes(path) {
   const running = gen.get(path)
-  if (running && running.status === 'running') { say('这场会议的纪要正在生成中', { level: 'info' }); return }
+  if (running && running.status === 'running') { say(t('genRunning'), { level: 'info' }); return }
   let md = null
   try { md = ctx.app.readFile ? await ctx.app.readFile(path) : null } catch { md = null }
-  if (md == null) { say('读不到会议文件(可能已被移动或删除)', { level: 'error' }); return }
+  if (md == null) { say(t('errReadMeeting'), { level: 'error' }); return }
   const meeting = parseMeeting(md)
-  if (!meeting.bullets.length && !meeting.transcript.length) { say('这场会议既没有要点也没有转写内容,没法生成纪要', { level: 'warning' }); return }
+  if (!meeting.bullets.length && !meeting.transcript.length) { say(t('warnEmptyMeeting'), { level: 'warning' }); return }
   const cfg = await getCfg()
   if (!cfg.backendUrl || !cfg.token) {
-    const msg = cfg.backendUrl ? '请先登录 Forsion' : '未连接到 Tangu 引擎(需 Forsion 桌面端)'
+    const msg = cfg.backendUrl ? t('errNeedLogin') : t('errNoEngine')
     gen.set(path, { status: 'error', label: '', text: '', error: msg, controller: null })
     bus.emit({ type: 'gen', path })
     say(msg, { level: 'error' })
     return
   }
-  const g = { status: 'running', label: '提交任务', text: '', error: '', controller: new AbortController() }
+  const g = { status: 'running', label: t('stageSubmit'), text: '', error: '', controller: new AbortController() }
   gen.set(path, g)
   bus.emit({ type: 'gen', path })
   const message = buildMinutesPrompt(meeting)
@@ -836,7 +1137,7 @@ async function generateMinutes(path) {
       // 随包 agent 未播种(旧宿主/装后未重启引擎)会在产出任何 token 前失败 → 回退不带 agentSlug。
       // 指令全在 message 里,行为一致;已开始产出/主动取消则不重试(避免白烧一轮)。
       if (g.controller.signal.aborted || g.text) throw e
-      onStage('回退默认助手重试')
+      onStage(t('stageFallback'))
       usedFallback = true
       out = await runAgent(cfg, uuid(), message, null, onTick, g.controller.signal, onStage)
     }
@@ -846,22 +1147,22 @@ async function generateMinutes(path) {
       // 首轮带 slug 正常产出了 token 却解析不出 ```minutes:十有八九是引擎里蹲着同 slug 异契约的
       // 旧 agent(播种「已存在则保留」,老实体永远不被覆盖,产出别的格式)——再回退一轮默认助手,
       // 而不是直接报死错让用户每次白烧一轮 token 且永无自愈。
-      onStage('产出不合约,回退默认助手重试')
+      onStage(t('stageBadFormat'))
       g.text = ''
       usedFallback = true
       out = await runAgent(cfg, uuid(), message, null, onTick, g.controller.signal, onStage)
       parsed = parseMinutesBlock(out)
     }
-    if (unusable(parsed)) throw new Error('模型没有按约定返回 ```minutes 代码块,请重试一次')
+    if (unusable(parsed)) throw new Error(t('errNoMinutesBlock'))
     // 防 TOCTOU:生成期间用户可能在笔记里改过这份文件 —— 重新读盘,外科式只替换 纪要/行动项/状态
     let fresh = null
     try { fresh = await ctx.app.readFile(path) } catch { fresh = null }
-    if (fresh == null) throw new Error('会议文件在生成期间被移动或删除,纪要未写入')
+    if (fresh == null) throw new Error(t('errFileGoneDuringGen'))
     const nextText = applyMinutesToText(fresh, parsed)
     await ctx.app.writeFile(path, nextText)
     try { await upsertIndex(path, parseMeeting(nextText)) } catch { /* 打开时自愈 */ }
     if (ctx.activity && ctx.activity.log) ctx.activity.log('meeting_done', { title: meeting.title })
-    say('纪要已生成', { level: 'success' })
+    say(t('okMinutes'), { level: 'success' })
     gen.delete(path)
     bus.emit({ type: 'gen', path })
     bus.emit({ type: 'minutes-done', path })
@@ -871,7 +1172,7 @@ async function generateMinutes(path) {
     else {
       const msg = (e && e.message) || String(e)
       gen.set(path, { status: 'error', label: '', text: '', error: msg, controller: null })
-      say('纪要生成失败:' + msg, { level: 'error' })
+      say(t('errMinutesFailed', { err: msg }), { level: 'error' })
     }
     bus.emit({ type: 'gen', path })
   }
@@ -902,11 +1203,11 @@ async function collectActions() {
 async function toggleAction(path, rawLine, done, lineNo) {
   let md = null
   try { md = ctx.app.readFile ? await ctx.app.readFile(path) : null } catch { md = null }
-  if (md == null) { say('读不到会议文件', { level: 'error' }); return false }
+  if (md == null) { say(t('errReadMeetingShort'), { level: 'error' }); return false }
   const next = toggleActionInText(md, rawLine, done, lineNo)
-  if (next == null) { say('没找到这一行行动项(文件可能已被编辑),已刷新列表', { level: 'warning' }); bus.emit({ type: 'actions' }); return false }
+  if (next == null) { say(t('warnActionLineGone'), { level: 'warning' }); bus.emit({ type: 'actions' }); return false }
   try { await ctx.app.writeFile(path, next) }
-  catch (e) { say('勾选没写回(保存失败):' + ((e && e.message) || e), { level: 'error' }); return false }
+  catch (e) { say(t('errToggleSave', { err: (e && e.message) || e }), { level: 'error' }); return false }
   try { await upsertIndex(path, parseMeeting(next)) } catch { /* 打开时自愈 */ }
   bus.emit({ type: 'actions' })
   return true
@@ -968,8 +1269,9 @@ function syncTheme(rootEl) {
   const danger = tok('--danger') || (dark ? '#e08a7d' : '#b03a2e')
   const drc = parseColor(danger) || [176, 58, 46, 1]
   const targets = [rootEl, layer()].filter(Boolean)
-  const set = (k, v) => targets.forEach((t) => t.style.setProperty(`--mt-${k}`, v))
-  targets.forEach((t) => { t.style.colorScheme = dark ? 'dark' : 'light' })
+  // 形参一律不叫 t:模块级 t() 是翻译函数,被遮蔽后谁在回调里加一句 t('…') 就是 TypeError
+  const set = (k, v) => targets.forEach((n) => n.style.setProperty(`--mt-${k}`, v))
+  targets.forEach((n) => { n.style.colorScheme = dark ? 'dark' : 'light' })
   set('text', tok('--text') || `rgb(${rd(rgb[0])},${rd(rgb[1])},${rd(rgb[2])})`)
   set('text-sec', tok('--text-light') || f(.72)); set('text-muted', tok('--text-muted') || f(.5)); set('text-subtle', tok('--text-faint') || f(.32))
   set('bg', tok('--bg') || `rgb(${rd(bgc[0])},${rd(bgc[1])},${rd(bgc[2])})`)
@@ -1098,8 +1400,8 @@ function confirmBox(title, desc, okLabel) {
     const h = document.createElement('div'); h.className = 'ttl'; h.textContent = title
     const p = document.createElement('div'); p.className = 'desc'; p.textContent = desc || ''
     const row = document.createElement('div'); row.className = 'mt-row'; row.style.justifyContent = 'flex-end'; row.style.marginTop = '12px'
-    const no = document.createElement('button'); no.className = 'mt-btn ghost sm'; no.textContent = '取消'
-    const ok = document.createElement('button'); ok.className = 'mt-btn primary sm'; ok.textContent = okLabel || '确定'
+    const no = document.createElement('button'); no.className = 'mt-btn ghost sm'; no.textContent = t('btnCancel')
+    const ok = document.createElement('button'); ok.className = 'mt-btn primary sm'; ok.textContent = okLabel || t('btnOk')
     const done = (v) => { ov.remove(); resolve(v) }
     no.addEventListener('click', () => done(false))
     ok.addEventListener('click', () => done(true))
@@ -1144,10 +1446,16 @@ function downloadText(name, text) {
     a.download = name
     document.body.appendChild(a); a.click(); a.remove()
     setTimeout(() => URL.revokeObjectURL(a.href), 20000)
-  } catch (e) { say('导出失败:' + ((e && e.message) || e), { level: 'error' }) }
+  } catch (e) { say(t('errExport', { err: (e && e.message) || e }), { level: 'error' }) }
 }
 
 // ══ 单视图状态机:idle(表单+列表+行动项总览)/ rec(录音中)/ done(纪要三 tab) ══
+
+/** 已挂载的视图实例(可能不止一个:多窗口 / 多 Space)。语言切换时逐个原地重渲。 */
+const mountedViews = new Set()
+function rerenderViews() {
+  mountedViews.forEach((v) => { try { v.rerender() } catch { /* 单个视图抛错不连累其它 */ } })
+}
 
 function mountRecorder(el) {
   el.innerHTML = ''
@@ -1155,6 +1463,9 @@ function mountRecorder(el) {
   const rootEl = document.createElement('div'); rootEl.className = 'mt-root'; el.appendChild(rootEl)
   const offTheme = themeObserver(rootEl)
   const $ = (s) => rootEl.querySelector(s)
+  /** 模板一律静态字面量(innerHTML 纪律),文案在此按当前语言填 —— 切语言重渲即全量刷新。 */
+  const setTx = (sel, s) => { const n = $(sel); if (n) n.textContent = s }
+  const setPh = (sel, s) => { const n = $(sel); if (n) n.setAttribute('placeholder', s) }
   let mode = 'idle'          // idle | rec | done
   let idleTab = 'meetings'   // meetings | actions
   let donePath = '', doneTab = 'minutes', doneMeeting = null, doneText = ''
@@ -1169,35 +1480,43 @@ function mountRecorder(el) {
 <div class="mt-app">
   <div class="mt-body">
     <div class="mt-hero">
-      <h1>会议记录员</h1>
-      <p>会中录音 + 随手记要点,分段实时转写;会后 AI 融合出结构化纪要与行动项。</p>
+      <h1 data-hero-title></h1>
+      <p data-hero-sub></p>
       <div class="mt-banner" data-banner style="display:none"></div>
       <div class="mt-panel mt-form" data-form>
-        <input class="mt-input" data-title placeholder="会议标题(留空 = 即时会议)" />
-        <input class="mt-input" data-attendees style="margin-top:8px" placeholder="与会人,逗号分隔(可选,如:张三, 李四)" />
+        <input class="mt-input" data-title />
+        <input class="mt-input" data-attendees style="margin-top:8px" />
         <div class="mt-row" style="justify-content:space-between;margin-top:10px">
           <span class="mt-muted" style="font-size:11px" data-seghint></span>
-          <button class="mt-btn primary" data-start>开始录音</button>
+          <button class="mt-btn primary" data-start></button>
         </div>
-        <div class="mt-muted" style="font-size:11px;margin-top:8px">只采集麦克风;音频分段转写后即弃、不保存原始录音;关闭应用会直接结束录音。</div>
+        <div class="mt-muted" style="font-size:11px;margin-top:8px" data-privacy></div>
       </div>
       <div class="mt-panel mt-live-card" data-livecard style="display:none">
         <span class="mt-dot"></span>
         <span class="ttl" data-lc-title></span>
         <span class="mt-muted" data-lc-timer style="font-variant-numeric:tabular-nums"></span>
-        <button class="mt-btn primary sm" data-lc-open>回到录音</button>
+        <button class="mt-btn primary sm" data-lc-open></button>
       </div>
     </div>
     <div class="mt-list-wrap">
       <div class="mt-tabs">
-        <div class="mt-tab" data-tab="meetings">会议列表</div>
-        <div class="mt-tab" data-tab="actions">行动项总览</div>
+        <div class="mt-tab" data-tab="meetings"></div>
+        <div class="mt-tab" data-tab="actions"></div>
       </div>
       <div data-list></div>
     </div>
   </div>
 </div>`
-    $('[data-seghint]').textContent = `每 ${segMinutes()} 分钟一段送转写(插件设置可调)`
+    setTx('[data-hero-title]', t('heroTitle'))
+    setTx('[data-hero-sub]', t('heroSub'))
+    setPh('[data-title]', t('phTitle'))
+    setPh('[data-attendees]', t('phAttendees'))
+    setTx('[data-start]', t('btnStart'))
+    setTx('[data-privacy]', t('privacyNote'))
+    setTx('[data-lc-open]', t('btnBackToRec'))
+    rootEl.querySelectorAll('.mt-tab').forEach((el) => { el.textContent = el.getAttribute('data-tab') === 'actions' ? t('tabAllActions') : t('tabMeetings') })
+    setTx('[data-seghint]', t('segHint', { n: segMinutes() }))
     const cap = capability()
     if (!cap.ok) {
       const banner = $('[data-banner]')
@@ -1217,27 +1536,29 @@ function mountRecorder(el) {
       const btn = $('[data-start]')
       if (!btn || btn.disabled) return
       btn.disabled = true
-      btn.textContent = '正在打开麦克风…'
+      btn.textContent = t('btnStarting')
       const r = await startRecording($('[data-title]') ? $('[data-title]').value : '', $('[data-attendees]') ? $('[data-attendees]').value : '')
       if (r.ok) { if (mode === 'idle') renderRec(); return }
       if (mode !== 'idle') return
       const b2 = $('[data-start]')
-      if (b2) { b2.disabled = !capability().ok; b2.textContent = '开始录音' }
+      if (b2) { b2.disabled = !capability().ok; b2.textContent = t('btnStart') }
     })
-    rootEl.querySelectorAll('.mt-tab').forEach((t) => t.addEventListener('click', () => { idleTab = t.getAttribute('data-tab'); renderIdleList() }))
-    renderIdleList()
+    rootEl.querySelectorAll('.mt-tab').forEach((el) => el.addEventListener('click', () => { idleTab = el.getAttribute('data-tab'); renderIdleList() }))
+    return renderIdleList() // 返回 promise:切语言重渲时要等列表填完才能把滚动位放回去
   }
   function updateIdleClock() {
-    const t = $('[data-lc-timer]')
-    if (!t || !recState.startedAt) return
-    t.textContent = recState.active ? `● 录音中 ${fmtBullet(Math.round((Date.now() - recState.startedAt) / 1000))}` : '完成转写中…'
+    const el = $('[data-lc-timer]')
+    if (!el || !recState.startedAt) return
+    el.textContent = recState.active
+      ? t('sbRecording', { time: fmtBullet(Math.round((Date.now() - recState.startedAt) / 1000)) })
+      : t('idleWrapUp')
   }
   async function renderIdleList() {
-    rootEl.querySelectorAll('.mt-tab').forEach((t) => t.classList.toggle('on', t.getAttribute('data-tab') === idleTab))
+    rootEl.querySelectorAll('.mt-tab').forEach((el) => el.classList.toggle('on', el.getAttribute('data-tab') === idleTab))
     const box = $('[data-list]')
     if (!box) return
     box.textContent = ''
-    const loading = document.createElement('div'); loading.className = 'mt-empty'; loading.textContent = '加载中…'
+    const loading = document.createElement('div'); loading.className = 'mt-empty'; loading.textContent = t('loading')
     box.appendChild(loading)
     if (idleTab === 'meetings') {
       const idx = await healIndex()
@@ -1245,7 +1566,7 @@ function mountRecorder(el) {
       box.textContent = ''
       if (!idx.meetings.length) {
         const d = document.createElement('div'); d.className = 'mt-empty'
-        d.textContent = '还没有会议记录。填好标题点「开始录音」,要点、完整转写与 AI 纪要都会存进你的笔记库。'
+        d.textContent = t('emptyMeetings')
         box.appendChild(d)
         return
       }
@@ -1256,7 +1577,7 @@ function mountRecorder(el) {
       box.textContent = ''
       if (!acts.length) {
         const d = document.createElement('div'); d.className = 'mt-empty'
-        d.textContent = '没有未完成的行动项。生成纪要后,各场会议的 - [ ] 待办会聚合到这里,按截止日排序、过期红标。'
+        d.textContent = t('emptyAllActions')
         box.appendChild(d)
         return
       }
@@ -1266,12 +1587,12 @@ function mountRecorder(el) {
   function meetingRow(m) {
     const card = document.createElement('div'); card.className = 'mt-card'
     const top = document.createElement('div'); top.className = 'mt-row'; top.style.flexWrap = 'nowrap'
-    const ttl = document.createElement('div'); ttl.className = 'ttl'; ttl.textContent = m.title || '(未命名会议)'
+    const ttl = document.createElement('div'); ttl.className = 'ttl'; ttl.textContent = m.title || t('untitledMeeting')
     const badge = document.createElement('span')
     badge.className = 'mt-badge ' + (m.status === 'recording' ? 'rec' : m.status === 'transcribed' ? 'todo' : 'ok')
-    badge.textContent = m.status === 'recording' ? '● 录音中' : m.status === 'transcribed' ? '待纪要' : '已完成'
+    badge.textContent = m.status === 'recording' ? t('stRecording') : m.status === 'transcribed' ? t('stNeedsMinutes') : t('stDone')
     top.appendChild(ttl); top.appendChild(badge)
-    if (m.openActions > 0) { const b = document.createElement('span'); b.className = 'mt-badge open'; b.textContent = `${m.openActions} 项待办`; top.appendChild(b) }
+    if (m.openActions > 0) { const b = document.createElement('span'); b.className = 'mt-badge open'; b.textContent = t('openActions', { n: m.openActions }); top.appendChild(b) }
     const sub = document.createElement('div'); sub.className = 'sub'; sub.textContent = fmtDate(m.date)
     card.appendChild(top); card.appendChild(sub)
     card.addEventListener('click', () => {
@@ -1287,7 +1608,7 @@ function mountRecorder(el) {
       cb.disabled = true
       let ok = false
       try { ok = await toggleAction(a.path, a.raw, cb.checked, a.line) }
-      catch (e) { say('勾选失败:' + ((e && e.message) || e), { level: 'error' }) }
+      catch (e) { say(t('errToggle', { err: (e && e.message) || e }), { level: 'error' }) }
       if (!ok) { cb.checked = !cb.checked; cb.disabled = false } // 失败:弹回原状态可重试(成功路径由总线重绘)
     })
     const mid = document.createElement('div'); mid.className = 'mid'
@@ -1295,9 +1616,14 @@ function mountRecorder(el) {
     mid.appendChild(tx)
     const meta = document.createElement('div'); meta.className = 'meta'
     if (a.owner) { const o = document.createElement('span'); o.className = 'mt-chip'; o.textContent = '@' + a.owner; meta.appendChild(o) }
-    if (a.due) { const d = document.createElement('span'); d.className = 'mt-chip' + (a.overdue ? ' overdue' : ''); d.textContent = '📅 ' + a.due + (a.overdue ? ' 已过期' : ''); meta.appendChild(d) }
+    if (a.due) {
+      const d = document.createElement('span')
+      d.className = 'mt-chip' + (a.overdue ? ' overdue' : '')
+      d.textContent = a.overdue ? t('chipDueOverdue', { due: a.due }) : t('chipDue', { due: a.due })
+      meta.appendChild(d)
+    }
     if (showSource && a.meetingTitle) {
-      const s = document.createElement('span'); s.className = 'mt-chip src'; s.textContent = a.meetingTitle; s.title = '打开这场会议'
+      const s = document.createElement('span'); s.className = 'mt-chip src'; s.textContent = a.meetingTitle; s.title = t('tipOpenMeeting')
       s.addEventListener('click', () => renderDone(a.path))
       meta.appendChild(s)
     }
@@ -1313,9 +1639,9 @@ function mountRecorder(el) {
     rootEl.innerHTML = `
 <div class="mt-app">
   <div class="mt-hdr">
-    <button class="mt-btn ghost sm" data-back>← 返回</button>
+    <button class="mt-btn ghost sm" data-back></button>
     <div class="hd-title" style="flex:1" data-rtitle></div>
-    <button class="mt-btn stop" data-stop>结束录音</button>
+    <button class="mt-btn stop" data-stop></button>
   </div>
   <div class="mt-body mt-recwrap">
     <div class="mt-rec-top">
@@ -1326,25 +1652,31 @@ function mountRecorder(el) {
     </div>
     <div class="mt-cols">
       <div class="mt-col">
-        <div class="mt-label">实时转写</div>
+        <div class="mt-label" data-lab-live></div>
         <div class="mt-panel mt-livebox" data-live><div class="mt-empty" data-liveempty></div></div>
       </div>
       <div class="mt-col">
-        <div class="mt-label">要点速记</div>
+        <div class="mt-label" data-lab-bullets></div>
         <div class="mt-panel mt-bulletbox">
           <div class="mt-bullets" data-bullets></div>
-          <textarea class="mt-input mt-bullet-in" data-bin rows="2" placeholder="记要点,Enter 落一条(自动带相对时间戳)…"></textarea>
+          <textarea class="mt-input mt-bullet-in" data-bin rows="2"></textarea>
         </div>
       </div>
     </div>
-    <div class="mt-muted" style="font-size:11px;text-align:center">关掉这个视图录音也不断(状态栏可见);关闭应用 = 结束录音。</div>
+    <div class="mt-muted" style="font-size:11px;text-align:center" data-recfoot></div>
   </div>
 </div>`
+    setTx('[data-back]', t('btnBack'))
+    setTx('[data-stop]', t('btnStop'))
+    setTx('[data-lab-live]', t('labLiveTranscript'))
+    setTx('[data-lab-bullets]', t('labBullets'))
+    setTx('[data-recfoot]', t('recFooter'))
+    setPh('[data-bin]', t('phBullet'))
     $('[data-rtitle]').textContent = recState.meeting ? recState.meeting.title : ''
-    $('[data-liveempty]').textContent = `第一段转写完成后出现在这里(每 ${segMinutes()} 分钟一段)…`
+    $('[data-liveempty]').textContent = t('liveEmpty', { n: segMinutes() })
     $('[data-back]').addEventListener('click', renderIdle)
     $('[data-stop]').addEventListener('click', async () => {
-      const ok = await confirmBox('结束录音?', '结束后会完成剩余分段的转写,然后可一键生成纪要。', '结束录音')
+      const ok = await confirmBox(t('confirmStopTitle'), t('confirmStopDesc'), t('btnStop'))
       if (!ok) return
       const b = $('[data-stop]')
       if (b) b.disabled = true
@@ -1357,7 +1689,7 @@ function mountRecorder(el) {
       const v = bin.value
       bin.value = ''
       // 没记上(录音刚好收尾完)绝不静默吞:文字放回输入框并提示
-      addBullet(v).then((ok) => { if (!ok && String(v).trim()) { bin.value = v; say('这条要点没记上:录音已结束(可复制到笔记里)', { level: 'warning' }) } })
+      addBullet(v).then((ok) => { if (!ok && String(v).trim()) { bin.value = v; say(t('warnBulletLost'), { level: 'warning' }) } })
     })
     const cv = $('[data-wave]')
     if (recState.analyser) waveStop = drawWave(cv, recState.analyser)
@@ -1366,17 +1698,17 @@ function mountRecorder(el) {
     updateRecLive()
   }
   function recSegLabel() {
-    const parts = [`第 ${recState.segIndex} 段`, `已转写 ${recState.doneSegs} 段`]
-    if (recState.pending) parts.push(`${recState.pending} 段转写中`)
-    if (recState.failedSegs) parts.push(`${recState.failedSegs} 段失败`)
-    if (recState.stopping) parts.push('正在收尾…')
+    const parts = [t('segNo', { n: recState.segIndex }), t('segDoneCount', { n: recState.doneSegs })]
+    if (recState.pending) parts.push(t('segPendingCount', { n: recState.pending }))
+    if (recState.failedSegs) parts.push(t('segFailedCount', { n: recState.failedSegs }))
+    if (recState.stopping) parts.push(t('segWrapUp'))
     return parts.join(' · ')
   }
   function updateRecClock() {
-    const t = $('[data-timer]')
-    if (!t) return
+    const el = $('[data-timer]')
+    if (!el) return
     const sec = recState.startedAt ? Math.max(0, Math.round((Date.now() - recState.startedAt) / 1000)) : 0
-    t.textContent = fmtBullet(sec)
+    el.textContent = fmtBullet(sec)
     const segs = $('[data-segs]')
     if (segs) segs.textContent = recSegLabel()
   }
@@ -1407,33 +1739,33 @@ function mountRecorder(el) {
     let text = null
     try { text = ctx.app.readFile ? await ctx.app.readFile(path) : null } catch { text = null }
     if (mode !== 'done' || donePath !== path) return
-    if (text == null) { say('读不到会议文件(可能已被移动或删除)', { level: 'error' }); renderIdle(); return }
+    if (text == null) { say(t('errReadMeeting'), { level: 'error' }); renderIdle(); return }
     doneText = text
     const m = parseMeeting(text)
     doneMeeting = m
     rootEl.innerHTML = `
 <div class="mt-app">
   <div class="mt-hdr">
-    <button class="mt-btn ghost sm" data-back>← 返回</button>
+    <button class="mt-btn ghost sm" data-back></button>
     <div class="hd-main">
       <div class="hd-title" data-dtitle></div>
       <div class="mt-muted hd-sub" data-dsub></div>
     </div>
-    <button class="mt-btn ghost sm" data-copy>复制</button>
-    <button class="mt-btn ghost sm" data-export>导出 MD</button>
-    <button class="mt-btn sm" data-opennote>在笔记中打开</button>
+    <button class="mt-btn ghost sm" data-copy></button>
+    <button class="mt-btn ghost sm" data-export></button>
+    <button class="mt-btn sm" data-opennote></button>
   </div>
   <div class="mt-body">
     <div class="mt-tabs" style="margin-top:0">
-      <div class="mt-tab" data-dtab="minutes">纪要</div>
-      <div class="mt-tab" data-dtab="transcript">转写</div>
-      <div class="mt-tab" data-dtab="actions">行动项</div>
+      <div class="mt-tab" data-dtab="minutes"></div>
+      <div class="mt-tab" data-dtab="transcript"></div>
+      <div class="mt-tab" data-dtab="actions"></div>
     </div>
     <div class="mt-panel mt-pane">
       <div data-pane-minutes>
         <div class="mt-row" style="justify-content:space-between;margin-bottom:10px">
-          <span class="mt-label">会议纪要</span>
-          <button data-gen>生成纪要</button>
+          <span class="mt-label" data-lab-minutes></span>
+          <button data-gen></button>
         </div>
         <div class="mt-prog" data-genprog style="display:none"></div>
         <div class="mt-out" data-minutes></div>
@@ -1444,36 +1776,40 @@ function mountRecorder(el) {
     </div>
   </div>
 </div>`
-    $('[data-dtitle]').textContent = m.title || '(未命名会议)'
-    const statusLabel = m.status === 'recording' ? '录音未正常收尾' : m.status === 'transcribed' ? '待纪要' : '已完成'
+    setTx('[data-back]', t('btnBack'))
+    setTx('[data-copy]', t('btnCopy'))
+    setTx('[data-export]', t('btnExport'))
+    setTx('[data-opennote]', t('btnOpenNote'))
+    setTx('[data-lab-minutes]', t('labMinutes'))
+    rootEl.querySelectorAll('[data-dtab]').forEach((el) => {
+      const k = el.getAttribute('data-dtab')
+      el.textContent = k === 'transcript' ? t('tabTranscript') : k === 'actions' ? t('tabActions') : t('tabMinutes')
+    })
+    $('[data-dtitle]').textContent = m.title || t('untitledMeeting')
+    const statusLabel = m.status === 'recording' ? t('stRecCrashed') : m.status === 'transcribed' ? t('stNeedsMinutes') : t('stDone')
     $('[data-dsub]').textContent = [fmtDate(m.dateIso), m.attendees, statusLabel].filter(Boolean).join(' · ')
     $('[data-back]').addEventListener('click', renderIdle)
     $('[data-copy]').addEventListener('click', async () => {
-      try { await navigator.clipboard.writeText(doneText); say('已复制整篇会议 Markdown', { level: 'success' }) }
-      catch { say('复制失败', { level: 'error' }) }
+      try { await navigator.clipboard.writeText(doneText); say(t('okCopied'), { level: 'success' }) }
+      catch { say(t('errCopy'), { level: 'error' }) }
     })
-    $('[data-export]').addEventListener('click', () => downloadText(path.split('/').pop() || '会议.md', doneText))
-    $('[data-opennote]').addEventListener('click', () => {
-      if (ctx.app.openFile) ctx.app.openFile(path)
-      else say('当前宿主不支持直接打开笔记', { level: 'warning' })
-    })
+    $('[data-export]').addEventListener('click', () => downloadText(path.split('/').pop() || t('exportFallbackName'), doneText))
+    $('[data-opennote]').addEventListener('click', () => { openNotePath(path) })
     // 生成按钮:未生成 = 高亮 primary;已生成 = 普通「重新生成」
     const genBtn = $('[data-gen]')
     genBtn.className = m.minutes ? 'mt-btn sm' : 'mt-btn primary sm'
-    genBtn.textContent = m.minutes ? '重新生成' : '生成纪要'
+    genBtn.textContent = m.minutes ? t('btnRegen') : t('btnGen')
     genBtn.addEventListener('click', () => generateMinutes(donePath))
     // 纪要 pane
     const outEl = $('[data-minutes]')
     if (m.minutes) renderMarkdown(outEl, m.minutes)
     else {
       const d = document.createElement('div'); d.className = 'mt-empty'
-      d.textContent = m.transcript.length || m.bullets.length
-        ? '转写已就绪。点「生成纪要」,AI 会把你的要点与完整转写融合成结构化纪要 + 行动项(只取会上说过的,不发明决议)。'
-        : '这场会议没有要点与转写内容。'
+      d.textContent = m.transcript.length || m.bullets.length ? t('minutesReady') : t('minutesNoSource')
       outEl.appendChild(d)
       if (m.bullets.length) {
         const pb = $('[data-prebullets]')
-        const lab = document.createElement('div'); lab.className = 'mt-label'; lab.textContent = '要点速记'; lab.style.margin = '10px 0 4px'
+        const lab = document.createElement('div'); lab.className = 'mt-label'; lab.textContent = t('labBullets'); lab.style.margin = '10px 0 4px'
         pb.appendChild(lab)
         for (const b of m.bullets) { const bd = document.createElement('div'); bd.className = 'mt-bullet'; bd.style.marginTop = '4px'; bd.textContent = b; pb.appendChild(bd) }
       }
@@ -1481,22 +1817,22 @@ function mountRecorder(el) {
     // 转写 pane
     const trEl = $('[data-pane-transcript]')
     if (m.transcript.length) renderTranscript(trEl, m.transcript)
-    else { const d = document.createElement('div'); d.className = 'mt-empty'; d.textContent = '没有转写内容。'; trEl.appendChild(d) }
+    else { const d = document.createElement('div'); d.className = 'mt-empty'; d.textContent = t('emptyTranscript'); trEl.appendChild(d) }
     // 行动项 pane
     const acEl = $('[data-pane-actions]')
     if (m.actions.length) {
       const today = todayStr()
       for (const a of m.actions) acEl.appendChild(actionRow({ path, meetingTitle: '', raw: a.raw, line: a.line, text: a.text, owner: a.owner, due: a.due, done: a.done, overdue: !a.done && !!a.due && a.due < today }, false))
-    } else { const d = document.createElement('div'); d.className = 'mt-empty'; d.textContent = '还没有行动项。生成纪要时会按「- [ ] 内容 @负责人 📅日期」自动提取。'; acEl.appendChild(d) }
+    } else { const d = document.createElement('div'); d.className = 'mt-empty'; d.textContent = t('emptyMeetingActions'); acEl.appendChild(d) }
     // tab 切换
     const setTab = (name) => {
       doneTab = name
-      rootEl.querySelectorAll('[data-dtab]').forEach((t) => t.classList.toggle('on', t.getAttribute('data-dtab') === name))
+      rootEl.querySelectorAll('[data-dtab]').forEach((el) => el.classList.toggle('on', el.getAttribute('data-dtab') === name))
       $('[data-pane-minutes]').style.display = name === 'minutes' ? '' : 'none'
       $('[data-pane-transcript]').style.display = name === 'transcript' ? '' : 'none'
       $('[data-pane-actions]').style.display = name === 'actions' ? '' : 'none'
     }
-    rootEl.querySelectorAll('[data-dtab]').forEach((t) => t.addEventListener('click', () => setTab(t.getAttribute('data-dtab'))))
+    rootEl.querySelectorAll('[data-dtab]').forEach((el) => el.addEventListener('click', () => setTab(el.getAttribute('data-dtab'))))
     setTab(doneTab === 'transcript' || doneTab === 'actions' ? doneTab : 'minutes')
     updateGenUI()
   }
@@ -1506,16 +1842,21 @@ function mountRecorder(el) {
     if (!btn) return
     if (g && g.status === 'running') {
       btn.disabled = true
-      btn.textContent = '生成中…'
-      if (prog) { prog.style.display = ''; prog.classList.remove('err'); prog.textContent = (g.label || '生成中') + (g.text ? ` · 已产出 ${g.text.length} 字` : '') }
+      btn.textContent = t('btnGenning')
+      if (prog) {
+        prog.style.display = ''
+        prog.classList.remove('err')
+        const label = g.label || t('btnGenning')
+        prog.textContent = g.text ? t('genProgress', { label, n: g.text.length }) : label
+      }
       if (out && g.text) {
         const parsed = parseMinutesBlock(g.text)
         out.textContent = parsed && parsed.minutes ? parsed.minutes : g.text.slice(-800) // 直播原文;完成后整页重绘走 renderMarkdown
       }
     } else if (g && g.status === 'error') {
       btn.disabled = false
-      btn.textContent = doneMeeting && doneMeeting.minutes ? '重新生成' : '生成纪要'
-      if (prog) { prog.style.display = ''; prog.classList.add('err'); prog.textContent = '生成失败:' + g.error }
+      btn.textContent = doneMeeting && doneMeeting.minutes ? t('btnRegen') : t('btnGen')
+      if (prog) { prog.style.display = ''; prog.classList.add('err'); prog.textContent = t('genFailed', { err: g.error }) }
     } else if (prog) prog.style.display = 'none'
   }
 
@@ -1543,6 +1884,8 @@ function mountRecorder(el) {
       else if (mode === 'idle') renderIdle()
       return
     }
+    // 统一左栏点了某场会议:直接翻到它的详情页(录音中不打断——正在录的那场才是现场)
+    if (e.type === 'open-meeting') { if (mode !== 'rec') renderDone(e.path); return }
     if (e.type === 'gen') { if (mode === 'done' && e.path === donePath) updateGenUI(); return }
     if (e.type === 'minutes-done') {
       if (mode === 'done' && e.path === donePath) renderDone(donePath)
@@ -1555,31 +1898,113 @@ function mountRecorder(el) {
     }
   })
 
+  // 语言切换:宿主广播 → 当前这页原地重渲(视图**不重挂**也必须变;录音/生成状态在模块级,重渲不打断)。
+  // 但重渲是整树 innerHTML 重建,**未提交的 DOM 输入不在模块级**:会中正打了一半的要点草稿、
+  // 还没点开录的标题/与会人、翻上去在读的转写滚动位,不自己快照回填就会被这次重建吞掉。
+  // 回填必须排在渲染之后(renderRec 的 updateRecLive / renderDone 的 setTab 都会动滚动位)。
+  const KEEP_VALUE = ['[data-title]', '[data-attendees]', '[data-bin]'] // 三个未提交输入
+  const KEEP_SCROLL = ['[data-live]', '.mt-body']                       // 实时转写栏 + 三页共用的滚动容器
+  const inst = {
+    rerender: () => {
+      const vals = {}, tops = {}
+      for (const s of KEEP_VALUE) { const n = $(s); if (n) vals[s] = n.value }
+      for (const s of KEEP_SCROLL) { const n = $(s); if (n) tops[s] = n.scrollTop }
+      // 元素不在(换页了/该页没这个格)就不回填:vals[s] == null 天然挡住
+      const restore = () => {
+        for (const s of KEEP_VALUE) { const n = $(s); if (n && vals[s] != null) n.value = vals[s] }
+        for (const s of KEEP_SCROLL) { const n = $(s); if (n && tops[s] != null) n.scrollTop = tops[s] }
+      }
+      if (mode === 'rec') { renderRec(); restore(); return }
+      // renderDone 是 async(先读盘再重建):回填只能挂在它的 promise 上;
+      // 读盘失败它自己已提示并回 idle,这里吞掉 rejection(rerenderViews 的 try 只包同步段)
+      if (mode === 'done' && donePath) { Promise.resolve(renderDone(donePath)).then(restore, () => { /* ignore */ }); return }
+      // idle 的列表是异步填的:先同步回填(输入框不闪空),列表落定后再补一次滚动位
+      Promise.resolve(renderIdle()).then(restore, () => { /* ignore */ })
+      restore()
+    },
+  }
+  mountedViews.add(inst)
+
   if (recState.active || recState.stopping) renderRec()
+  else if (pendingOpen) { const p = pendingOpen; pendingOpen = null; renderDone(p) }
   else renderIdle()
 
-  return () => { offTheme(); offBus(); if (waveStop) waveStop() } // 录音/生成在模块级:关视图不断
+  // 录音/生成在模块级:关视图不断
+  return () => { mountedViews.delete(inst); offTheme(); offBus(); if (waveStop) waveStop() }
 }
 
 // ── 注册(07-18 后的 ctx 面一律判存在:旧宿主缺席时优雅降级,setup 不抛) ──────────
 
-if (ctx.registerView) ctx.registerView({ id: 'recorder', title: '会议记录员', mount: mountRecorder, singleton: true })
+// 宿主贡献点的标题是单字符串、无运行时重解析:这里取的是**注册当时**的语言,
+// 切语言后命令面板/视图 tab 标题要等重启才跟上(宿主侧已知缺口,不许为它做重注册/teardown 自重来)。
+if (ctx.registerView) ctx.registerView({ id: 'recorder', title: t('viewTitle'), mount: mountRecorder, singleton: true, workspaceSource: 'meeting-list' })
+
+// ── 统一左栏列表源(宿主 2026-08-25+;可选链,老宿主静默跳过) ─────────────────────
+// 会议清单交给宿主统一左栏渲染(与会话/笔记行同一套 UI);分组=状态档,点一行 = 翻到那场的详情页。
+// 插件对界面无状态:搜索词与选中分组由宿主持有,经 items({query, group}) 回传。
+if (ctx.registerListSource) {
+  let listCache = [] // items() 必须同步且便宜 —— 索引的同步快照,绝不在 items() 里读盘
+  const listSubs = new Set()
+  const fireList = () => listSubs.forEach((f) => { try { f() } catch { /* ignore */ } })
+  // ⚠️ 只在 setup 里读一次不行:插件是在宿主**启动期**装的,那时活动库还没恢复,
+  //    ctx.app.readFile 此刻静默给 null → 列表永久空着(青鸟 2026-08-28 实报的同一个坑)。
+  //    宿主挂载列表面 / 切库都会重订阅,subscribe() 就是重读的门。
+  const listReload = () => readIndexFile().then((idx) => { listCache = idx.meetings || []; fireList() }, () => { /* 保留上一份 */ })
+  bus.on((e) => { if (e.type === 'rec-done' || e.type === 'minutes-done' || e.type === 'actions') void listReload() })
+  ctx.registerListSource({
+    id: 'meeting-list',
+    title: t('viewTitle'),
+    search: true,
+    items: (f) => {
+      const q = ((f && f.query) || '').trim().toLowerCase()
+      const g = f && f.group
+      return listCache
+        .filter((m) => m && m.path)
+        .filter((m) => (g == null ? true : (m.status || 'done') === g))
+        .filter((m) => !q || String(m.title || '').toLowerCase().includes(q))
+        .map((m) => ({
+          key: m.path,
+          title: m.title || (m.path.split('/').pop() || ''),
+          // 右侧 = 未完成行动项数(纯数字,语言中立);没有就留空,不画 0
+          hint: m.openActions ? String(m.openActions) : '',
+          icon: 'quote',
+        }))
+    },
+    // 分组 = 三个状态档,标签与列表页徽章**同一批词表键**(现取 t() → 跟着宿主语言走);空档不列。
+    groups: () => {
+      const c = {}
+      for (const m of listCache) { const k = (m && m.status) || 'done'; c[k] = (c[k] || 0) + 1 }
+      const label = { recording: 'stRecording', transcribed: 'stNeedsMinutes', done: 'stDone' }
+      return ['recording', 'transcribed', 'done'].filter((k) => c[k]).map((k) => ({ key: k, title: t(label[k]), count: c[k], icon: 'folder' }))
+    },
+    itemMenu: (item) => [{ id: 'open-note', label: t('btnOpenNote'), run: () => openNotePath(item.key) }],
+    subscribe: (cb) => { listSubs.add(cb); void listReload(); return () => listSubs.delete(cb) },
+    open: (item) => {
+      pendingOpen = item.key
+      bus.emit({ type: 'open-meeting', path: item.key })
+      if (ctx.openView) ctx.openView('recorder')
+    },
+  })
+}
 ctx.registerCommand({
-  id: 'meeting-open', title: '会议记录员:打开', keywords: 'meeting 会议 纪要 录音 转写 行动项 minutes recorder',
-  run: () => { if (ctx.openView) ctx.openView('recorder'); else say('当前宿主版本过旧,不支持工作台视图', { level: 'warning' }) },
+  id: 'meeting-open', title: t('cmdOpen'), keywords: 'meeting 会议 纪要 录音 转写 行动项 minutes recorder',
+  run: () => { if (ctx.openView) ctx.openView('recorder'); else say(t('warnOldHostView'), { level: 'warning' }) },
 })
 ctx.registerCommand({
-  id: 'meeting-start', title: '会议记录员:立即开始录音', keywords: 'meeting 会议 录音 record start 开始',
+  id: 'meeting-start', title: t('cmdStart'), keywords: 'meeting 会议 录音 record start 开始',
   run: async () => {
     if (ctx.openView) ctx.openView('recorder')
-    if (recState.active || recState.stopping) { say('已经在录音中', { level: 'info' }); return }
+    if (recState.active || recState.stopping) { say(t('infoAlreadyRecording'), { level: 'info' }); return }
     await startRecording('', '')
   },
 })
-const sb = ctx.registerStatusItem ? ctx.registerStatusItem({ id: 'status', side: 'right', text: '🎙 会议', title: '会议记录员', onClick: () => { if (ctx.openView) ctx.openView('recorder') } }) : null
+const sb = ctx.registerStatusItem ? ctx.registerStatusItem({ id: 'status', side: 'right', text: t('sbIdle'), title: t('sbTitle'), onClick: () => { if (ctx.openView) ctx.openView('recorder') } }) : null
+// 语言变化(只报变化,初值自己 getLocale()):状态栏 + 每个已挂载视图原地重渲,不重挂、不打断录音
+const offLocale = ctx.subscribeLocale ? ctx.subscribeLocale(() => { syncStatusBar(); rerenderViews() }) : null
 
 if (globalThis.__MEETING_TEST__) {
   Object.assign(globalThis.__MEETING_TEST__, {
+    MSG, L, t, tl, mountedViews, rerenderViews,
     pad2, fmtTs, fmtBullet, localDate, todayStr, fmtDate, slugify, clampSeg, safeHref,
     parseActionLine, serializeAction, parseTranscriptLine, parseMeeting, serializeMeeting,
     setFmValue, replaceSection, toggleActionInText, parseMinutesBlock, applyMinutesToText, sectionLines, mergeActionLines,
@@ -1594,6 +2019,8 @@ if (globalThis.__MEETING_TEST__) {
 return () => {
   // 插件停用:状态栏、定时器、媒体资源、生成任务、浮层全收干净(没人代管)
   pluginDisposed = true // 半路的 startRecording(权限弹窗/查重名 await 中)看到即刹车并停掉新流
+  if (offLocale) { try { offLocale() } catch { /* ignore */ } } // 宿主也会兜底统一收,该退还是要退
+  mountedViews.clear()
   if (sb && sb.dispose) sb.dispose()
   clearTimeout(recState.rotateTimer)
   clearTimeout(recState.tickTimer)
