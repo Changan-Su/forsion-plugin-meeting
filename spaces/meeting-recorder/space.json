@@ -2,6 +2,7 @@
   "id": "meeting-recorder",
   "name": { "zh": "会议记录员", "en": "Meeting Recorder" },
   "icon": "message-circle",
+  "iconFile": "icon.png",
   "version": "1.0.0",
   "layout": {
     "main": [{ "type": "plugin:meeting-recorder:recorder" }]

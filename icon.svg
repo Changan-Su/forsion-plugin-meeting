@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title">
+  <title id="title">Meeting Recorder — Voice notes</title>
+  <!-- Original Forsion plugin identity artwork, 2026-10-05. -->
+  <defs><linearGradient id="tile" x1="28" y1="12" x2="222" y2="252" gradientUnits="userSpaceOnUse"><stop stop-color="#57414b"/><stop offset="1" stop-color="#34272d"/></linearGradient></defs>
+  <rect x="4" y="4" width="248" height="248" rx="58" fill="url(#tile)"/>
+  <g style="--ink:#f7ecdf;--accent:#d1a2b2;--cut:#34272d" fill="none" stroke="var(--ink)" stroke-width="13" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="94" y="49" width="49" height="94" rx="24" fill="var(--ink)" stroke="none"/>
+    <path d="M73 111v12q0 48 45 48q45 0 45-48v-12M118 172v32m-29 0h58" stroke-width="12"/>
+    <path d="M180 75h19m-19 26h19" stroke="var(--accent)" stroke-width="10"/>
+  </g>
+</svg>
