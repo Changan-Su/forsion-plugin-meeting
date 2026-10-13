@@ -1,5 +1,9 @@
 # 会议记录员(meeting-recorder)
 
+> **这个插件不再更新,也已经从 Forsion 的商店下架。** 接替它的是[谛听](https://github.com/Changan-Su/forsion-plugin-diting)(实时转写、翻译、提问、纪要),在商店里搜「谛听」安装。已经装了会议记录员的可以继续用;记下的会议都是笔记库里普通的 Markdown,不受影响。
+>
+> **This plugin is no longer maintained and has been removed from the Forsion Store.** Its successor is [Diting](https://github.com/Changan-Su/forsion-plugin-diting) (live transcription, translation, Q&A and summaries). Existing installs keep working, and your meeting notes are plain Markdown in your vault.
+
 Granola 式会议记录插件:**会中**录音 + 随手记要点,分段实时转写;**会后** AI 把「你的要点 × 完整转写」融合成结构化纪要与行动项;**行动项跨会议再浮现**,勾选直接回写原笔记。
 
 > 本仓是 [Forsion](https://github.com/Changan-Su/Forsion)(AI 原生笔记 + 内置 Tangu Agent 的本地优先桌面工作台)的社区插件,捆绑包(bundle)形态:UI 视图 + 随包「会议书记官」Agent + 随包 Space。转写走 Forsion 自带语音链路,零额外配置、零第三方 ASR。
